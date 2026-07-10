@@ -2402,6 +2402,23 @@ def translate_switch(
     # Update the global stateful variable for later
     config_file = config
 
+    # If unified_os hasn't already been established (e.g. via a live SSH
+    # registration check in mc_register.py), infer it from the IOSXE
+    # version line in the config file itself. Unified OS switches
+    # (IOSXE 17.15.1+) require an uplink L3 interface to exist before any
+    # other L3/SVI interface can be created via the Meraki API.
+    if not unified_os:
+        try:
+            with open(config_file) as f:
+                config_text = f.read()
+            v_match = re.search(r"^version\s+(\d+)\.(\d+)", config_text, re.MULTILINE)
+            if v_match:
+                v_major, v_minor = int(v_match.group(1)), int(v_match.group(2))
+                if v_major > 17 or (v_major == 17 and v_minor >= 15):
+                    unified_os = True
+        except OSError:
+            pass
+
     # If we don't have an nm_list, create an empty list 9 switches long
     # which is larger than a stack so we can test for this later
     if nm_list == []:

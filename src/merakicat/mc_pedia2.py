@@ -874,28 +874,33 @@ type = 'access' if type == 'host' else type
             'iosxe': "allowedVlans = child.re_match_typed(regex=r'\sswitchport\strunk\sallowed\svlan\s+(\S.*)')"
         },
 
-        'vlan': {
+        'nativeVlan': {
             'name': "Native VLAN",
             'support':"✓",
             'translatable':"✓",
             'regex': r'\sswitchport\strunk\snative\svlan\s+(\S.*)',
             'meraki': {
                 'skip': False,
-                'default': '1'
+                'default': '1',
+                # Meraki's updateDeviceSwitchPort API has a single 'vlan'
+                # field that means native VLAN on trunk ports and access
+                # VLAN on access ports - both entries below must map to it.
+                'field': 'vlan'
             },
-            'iosxe': "vlan = child.re_match_typed(regex=r'\sswitchport\strunk\snative\svlan\s+(\S.*)')"
+            'iosxe': "nativeVlan = child.re_match_typed(regex=r'\sswitchport\strunk\snative\svlan\s+(\S.*)')"
         },
 
-        'vlan': {
+        'dataVlan': {
             'name': "Data VLAN",
             'support':"✓",
             'translatable':"✓",
             'regex': r'\sswitchport\svlan\s+(\S.*)',
             'meraki': {
                 'skip': False,
-                'default': '1'
+                'default': '1',
+                'field': 'vlan'
             },
-            'iosxe': "vlan = child.re_match_typed(regex=r'\sswitchport\svlan\s+(\S.*)')"
+            'iosxe': "dataVlan = child.re_match_typed(regex=r'\sswitchport\svlan\s+(\S.*)')"
         },
 
         'voiceVlan': {
@@ -979,11 +984,12 @@ while x < len(l3_ports):
                     response = requests.request('POST', url, headers=headers, data = data)
                     if debug:
                         print(response.text.encode('utf8'))
+                    response.raise_for_status()
                 else:
-                    dashboard.switch.createDeviceSwitchRoutingInterface(sw_list[0],ma[2],vlanId=ma[3],**ma[4])
+                    dashboard.switch.createDeviceSwitchRoutingInterface(sw_list[0],name=ma[2],vlanId=ma[3],**ma[4])
             conf_ports.append(ma[2])
-        except:
-            print(f'We had an issue creating {ma[2]}.')
+        except Exception as l3_exc:
+            print(f'We had an issue creating {ma[2]}: {l3_exc}')
             unconf_ports.append(ma[2])
         dg = x
         break
@@ -996,10 +1002,10 @@ while x < len(l3_ports):
             if 'switchStackId' in switch_dict.keys():
                 dashboard.switch.createNetworkSwitchStackRoutingInterface(ma[0],ma[1],ma[2],ma[3],**ma[4])
             else:
-                dashboard.switch.createDeviceSwitchRoutingInterface(swlist[0],name=ma[2],vlanId=ma[3],**ma[4])
+                dashboard.switch.createDeviceSwitchRoutingInterface(sw_list[0],name=ma[2],vlanId=ma[3],**ma[4])
             conf_ports.append(ma[2])
-        except:
-            print(f'We had an issue creating {ma[2]}.')
+        except Exception as l3_exc:
+            print(f'We had an issue creating {ma[2]}: {l3_exc}')
             unconf_ports.append(ma[2])
     x+=1
 return_vals = ['l3_ports','conf_ports','unconf_ports']
@@ -1666,10 +1672,10 @@ def index_mc_pedia(index_args):
     print(blurb+"==============================\n")
     for key,value in mc_pedia.items():
         if key in ["version","dated"]:
-            print(key+": "+value+"\n")
+            print(f"{key}: {value}\n")
         else:
-            print(key+":\n")
-            for k,v in value.items():
+            print(f"{key}:\n")
+            for k,v in value.items(): # type: ignore
                 skip = 0
                 if "translatable" in index_args:
                     if "translatable" not in v:
@@ -1683,9 +1689,9 @@ def index_mc_pedia(index_args):
                         skip = 1
                 if skip == 0:
                     if "name" in v:
-                        print(" - "+v['name']+"\n")
+                        print(f" - {v['name']}\n")
                     else:
-                        print(" - "+k+" (for Meraki)\n")
+                        print(f" - {k} (for Meraki)\n")
     if len(index_args) == 0:
         print("\n\nTo print the index based on either supported and translatable items or both, enter")
         print("    python mc_pedia.py [support] [translatable]")

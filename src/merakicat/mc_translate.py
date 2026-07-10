@@ -54,9 +54,13 @@ def Evaluate(config_file, nm_list, unified_os):
         for key, val in mc_pedia["switch"].items():
             newvals = {}
             exec(val.get("iosxe"), locals(), newvals)
-            switch_dict[key] = newvals[key]
-            if debug:
-                print(f"switch_dict['{key}'] = {switch_dict[key]}")
+            try:
+                switch_dict[key] = newvals[key]
+                if debug:
+                    print(f"switch_dict['{key}'] = {switch_dict[key]}")
+            except KeyError:
+                if debug:
+                    print(f"KeyError: '{key}' not found in newvals for switch")
 
         Gig_uplink = list()
         Ten_Gig_uplink = list()
@@ -432,16 +436,24 @@ def MerakiConfig(
                     exec(val["meraki"].get("post_process"), locals(), newvals)
                     if debug:
                         print(f"newvals = {newvals}")
-                    return_vals = newvals["return_vals"]
-                    if debug:
-                        print(
-                            f"newvals['return_vals'] = " + f"{newvals['return_vals']}"
-                        )
-                    n = 0
-                    while n < len(return_vals):
-                        switch_dict[return_vals[n]] = newvals[return_vals[n]]
-                        returns_dict[return_vals[n]] = newvals[return_vals[n]]
-                        n += 1
+                    try:
+                        return_vals = newvals["return_vals"]
+                        if debug:
+                            print(
+                                f"newvals['return_vals'] = " + f"{newvals['return_vals']}"
+                            )
+                        n = 0
+                        while n < len(return_vals):
+                            try:
+                                switch_dict[return_vals[n]] = newvals[return_vals[n]]
+                                returns_dict[return_vals[n]] = newvals[return_vals[n]]
+                            except KeyError:
+                                if debug:
+                                    print(f"KeyError: '{return_vals[n]}' not found in newvals")
+                            n += 1
+                    except KeyError:
+                        if debug:
+                            print("KeyError: 'return_vals' not found in newvals")
                     if debug:
                         print(f"switch_dict = {switch_dict}")
 
@@ -491,6 +503,12 @@ def MerakiConfig(
                 )
                 for key, val in mc_pedia["port"].items():
                     newvals = {}
+                    # Some encyclopedia keys (e.g. nativeVlan/dataVlan) map
+                    # to the same underlying Meraki API field, since Meraki
+                    # exposes one 'vlan' param for both access and native
+                    # VLAN. Use that mapping instead of the pedia key name
+                    # when talking to the API.
+                    field = val["meraki"].get("field", key)
                     if val["meraki"]["skip"] is not True:
                         # Apply any post processing for Meraki config
                         if val["meraki"]["skip"] in ["post_process", "post_ports"]:
@@ -505,13 +523,15 @@ def MerakiConfig(
                         try:
                             # Update the features we will later apply
                             # for this interface
-                            args[y][2].update({key: intf_settings[key]})
+                            args[y][2].update({field: intf_settings[key]})
                         except:
-                            if "default" in val["meraki"]:
+                            if "default" in val["meraki"] and field not in args[y][2]:
                                 # We weren't given a value for this feature,
-                                # apply the Meraki default value
+                                # and no sibling key already supplied a real
+                                # value for the same API field, so apply the
+                                # Meraki default value
                                 intf_settings[key] = val["meraki"]["default"]
-                                args[y][2].update({key: intf_settings[key]})
+                                args[y][2].update({field: intf_settings[key]})
                         if "return_vals" in newvals:
                             # We must have called a post-process feature in
                             # the encyclopedia that also has a
@@ -533,9 +553,13 @@ def MerakiConfig(
                                 # encyclopedia_key, [a list of values]
                                 # There can be multiple instances, so we will
                                 # append them all to a list of lists
-                                post_ports_list.append(
-                                    [return_vals[n], newvals[return_vals[n]]]
-                                )
+                                try:
+                                    post_ports_list.append(
+                                        [return_vals[n], newvals[return_vals[n]]]
+                                    )
+                                except KeyError:
+                                    if debug:
+                                        print(f"KeyError: '{return_vals[n]}' not found in newvals")
                                 if debug:
                                     print("post_ports_list = " + f"{post_ports_list}")
                                 n += 1
@@ -608,7 +632,7 @@ def MerakiConfig(
                                             f"KeyError: {key} not found in newvals for {interface_descriptor}"
                                         )
                         if debug:
-                            print(f"key = {key}, " + f"newvals[key] = {newvals[key]}")
+                            print(f"key = {key}, " + f"newvals[key] = {newvals.get(key, 'NOT FOUND')}")
                         try:
                             # Update the features we will later apply
                             # for this interface
@@ -637,9 +661,13 @@ def MerakiConfig(
                             while n < len(return_vals):
                                 if debug:
                                     print(f"return_vals[{n}] = " + f"{return_vals[n]}")
-                                args[y][4].update(
-                                    {return_vals[n]: newvals[return_vals[n]]}
-                                )
+                                try:
+                                    args[y][4].update(
+                                        {return_vals[n]: newvals[return_vals[n]]}
+                                    )
+                                except KeyError:
+                                    if debug:
+                                        print(f"KeyError: '{return_vals[n]}' not found in newvals")
                                 if debug:
                                     print(
                                         f"args for {interface_descriptor}"
@@ -715,7 +743,7 @@ def MerakiConfig(
                     )
                     if "return_vals" in newvals:
                         return_vals = newvals["return_vals"]
-                        if "channel_port_dict" in return_vals:
+                        if "channel_port_dict" in return_vals and "channel_port_dict" in newvals:
                             if debug:
                                 print(
                                     "newvals['channel_port_dict'] = "
@@ -729,14 +757,14 @@ def MerakiConfig(
                                     print(
                                         "port_dict[a_port] = " + f"{port_dict[a_port]}"
                                     )
-                        if "conf_ports" in return_vals:
+                        if "conf_ports" in return_vals and "conf_ports" in newvals:
                             cp_list = newvals["conf_ports"]
                             if debug:
                                 print(f"cp_list = {cp_list}")
                             for port in cp_list:
                                 switch_num = "stack" if len(sw_list) > 1 else 0
                                 conf_ports[switch_num].append(port)
-                        if "unconf_ports" in return_vals:
+                        if "unconf_ports" in return_vals and "unconf_ports" in newvals:
                             up_list = newvals["unconf_ports"]
                             if debug:
                                 print(f"up_list = {up_list}")

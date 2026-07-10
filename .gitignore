@@ -152,3 +152,5 @@ src/merakicat/testscript.sh
 ~*.xlsx
 *.xlsx
 textfsm_test.py
+
+/ErrorFile

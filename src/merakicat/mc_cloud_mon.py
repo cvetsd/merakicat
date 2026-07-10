@@ -1,8 +1,11 @@
-from netmiko import ConnectHandler
-import meraki
-import re
 import os
+import re
+
+import meraki
+from netmiko import ConnectHandler
+
 from mc_constants import DEFAULT_FILES_FOLDER
+
 try:
     from mc_user_info import DEBUG
 except ImportError:
@@ -24,10 +27,7 @@ def CloudSwitch(dashboard, meraki_org, host_id, ios_username, ios_password,
     :return: (I'm not sure yet what I will return other than success/failure')
     """
 
-    debug = DEBUG
-
     devices = list()
-    host_name = ""
 
     # SSH to the switch with netmiko, read the config, grab the
     # hostname, write the config out to a file using the hostname
@@ -61,8 +61,8 @@ def CloudSwitch(dashboard, meraki_org, host_id, ios_username, ios_password,
     net_connect.send_command('term len 24')
     net_connect.disconnect()
 
-    dir = os.path.join(os.getcwd(), DEFAULT_FILES_FOLDER)
-    config_file = os.path.join(dir, switch_name + ".cfg")
+    config_dir = os.path.join(os.getcwd(), DEFAULT_FILES_FOLDER)
+    config_file = os.path.join(config_dir, switch_name + ".cfg")
     file = open(config_file, "w")
     file.writelines(config)
     file.close()
@@ -99,10 +99,6 @@ def CloudSwitch(dashboard, meraki_org, host_id, ios_username, ios_password,
             },
             "rotaryNumber": 50
         }
-    }
-
-    dev_info2 = {
-        "sudi": sudi
     }
 
     devices.append(dev_info)
