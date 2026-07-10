@@ -65,6 +65,7 @@ from mc_file_exists import FileExists
 from mc_get_config import GetConfig
 from mc_get_networks import get_networks
 from mc_get_nms import GetNmList
+from mc_get_switch_config import get_switch_config
 from mc_hostnames_file import load_hostnames_from_file
 from mc_inventory import get_switch_inventory_by_mac
 from mc_meraki_dry_run import (
@@ -612,6 +613,13 @@ def greeting(incoming_msg, dashboard: meraki.DashboardAPI | None):
             if user_text.lower().startswith("get"):
                 if re.fullmatch(r"get\s+networks\s*", user_text, re.IGNORECASE):
                     response.markdown = get_networks(dashboard, meraki_org)
+                elif re.fullmatch(
+                    r"get\s+switch-config\s+(\S+)\s*", user_text, re.IGNORECASE
+                ):
+                    match = re.fullmatch(
+                        r"get\s+switch-config\s+(\S+)\s*", user_text, re.IGNORECASE
+                    )
+                    response.markdown = get_switch_config(dashboard, match.group(1))
                 elif re.search(r"\bcloud-ids\s+", user_text, re.IGNORECASE):
                     rest = re.split(
                         r"\bcloud-ids\s+", user_text, maxsplit=1, flags=re.IGNORECASE

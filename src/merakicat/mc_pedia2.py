@@ -894,13 +894,13 @@ type = 'access' if type == 'host' else type
             'name': "Data VLAN",
             'support':"✓",
             'translatable':"✓",
-            'regex': r'\sswitchport\svlan\s+(\S.*)',
+            'regex': r'\sswitchport\saccess\svlan\s+(\S.*)',
             'meraki': {
                 'skip': False,
                 'default': '1',
                 'field': 'vlan'
             },
-            'iosxe': "dataVlan = child.re_match_typed(regex=r'\sswitchport\svlan\s+(\S.*)')"
+            'iosxe': "dataVlan = child.re_match_typed(regex=r'\sswitchport\saccess\svlan\s+(\S.*)')"
         },
 
         'voiceVlan': {
@@ -984,7 +984,10 @@ while x < len(l3_ports):
                     response = requests.request('POST', url, headers=headers, data = data)
                     if debug:
                         print(response.text.encode('utf8'))
-                    response.raise_for_status()
+                    if not response.ok:
+                        raise Exception(
+                            f"{response.status_code} {response.reason} for {url}: {response.text}"
+                        )
                 else:
                     dashboard.switch.createDeviceSwitchRoutingInterface(sw_list[0],name=ma[2],vlanId=ma[3],**ma[4])
             conf_ports.append(ma[2])

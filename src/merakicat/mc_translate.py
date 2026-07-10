@@ -851,6 +851,17 @@ def MerakiConfig(
     failed_batch_ids = [
         batch["id"] for batch in new_batches_statuses if batch["status"]["failed"]
     ]
+    if failed_batch_ids:
+        # A batch can be built and submitted successfully but still fail to
+        # apply server-side; conf_ports/unconf_ports above only reflect
+        # whether we could build the actions locally, so surface batch
+        # failures explicitly here rather than silently reporting success.
+        print(
+            "Warning: one or more Dashboard action batches failed to apply: "
+            + f"{failed_batch_ids}. Some ports reported as translated above "
+            + "may not actually be configured - check the batch(es) in "
+            + "Dashboard under Organization > Action batches."
+        )
     if debug:
         print(f"Failed batch IDs are as follows: {failed_batch_ids}")
 
