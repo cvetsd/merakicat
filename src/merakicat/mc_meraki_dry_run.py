@@ -26,6 +26,7 @@ Limitations
 
 from __future__ import annotations
 
+import io
 import json
 import uuid
 from typing import Any, Dict, Optional
@@ -90,6 +91,10 @@ def _json_response(body: dict) -> requests.Response:
     r = requests.Response()
     r.status_code = 200
     r._content = json.dumps(body).encode("utf-8")
+    r._content_consumed = True
+    # The SDK calls response.close() after a DELETE, which dereferences .raw.
+    # A bare requests.Response leaves it None, so give it a real file object.
+    r.raw = io.BytesIO(r._content)
     r.headers["Content-Type"] = "application/json"
     return r
 
@@ -112,6 +117,13 @@ def _fake_body_for_mutating(metadata: dict, method: str, url: str) -> dict:
             },
         }
 
+    if method == "POST":
+        # Almost every create* operation returns the new object and callers
+        # immediately read ['id'] off it (mc_pedia2 does this for the switch
+        # stack). A synthetic id keeps them running; it is never sent anywhere
+        # because the follow-up calls that would use it are swallowed too.
+        return {"id": f"dry-run-{uuid.uuid4().hex[:12]}"}
+
     # Default: empty object; callers that require fields may need branching.
     return {}
 
@@ -133,6 +145,23 @@ class DryRunRestSession(RestSession):
             )
         else:
             print(f"[DRY-RUN] {method} {operation} ({tag}) — not sent")
+
+        if method in ("PUT", "PATCH"):
+            # Callers read fields straight off the response - mc_pedia2's
+            # switch_name snippet does response['url'] and
+            # response['networkId'] - and an empty body makes them fail in
+            # ways a real run never would. The resource's current state is the
+            # closest honest stand-in for "the update happened", and GETs are
+            # allowed here, so read it back instead of inventing one.
+            try:
+                probe = dict(metadata)
+                probe["operation"] = f"{operation} (dry-run read-back)"
+                return super().request(probe, "GET", url)
+            except Exception as read_back_exc:
+                if self._logger:
+                    self._logger.info(
+                        f"[DRY-RUN] read-back of {url} failed: {read_back_exc}"
+                    )
 
         body = _fake_body_for_mutating(metadata, method, url)
         return _json_response(body)

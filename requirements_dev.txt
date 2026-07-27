@@ -11,7 +11,9 @@ Sphinx>=1.8.1
 twine>=1.12.1
 webexteamssdk>=1.6.1
 webex-bot>=0.4.7
-meraki>=2.0.3
+# meraki 4.x moved RestSession out of meraki.rest_session, which
+# mc_meraki_dry_run imports at module scope, so cap below 4 for now.
+meraki>=1.46.0,<4
 white>=0.1.2
 requests-mock
 netmiko>=4.3.0

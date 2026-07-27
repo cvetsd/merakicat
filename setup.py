@@ -21,7 +21,8 @@ requirements = [
     "netmiko==4.3.0",
     "tabulate==0.9.0",
     "ciscoconfparse2==0.7.50",
-    "meraki==1.46.0",
+    # 4.x moved RestSession out of meraki.rest_session (see mc_meraki_dry_run).
+    "meraki>=1.46.0,<4",
     "python-docx==1.1.2",
     "docx2pdf==0.1.8",
     "requests==2.31.0",

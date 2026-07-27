@@ -154,3 +154,7 @@ src/merakicat/testscript.sh
 textfsm_test.py
 
 /ErrorFile
+/TempFiles
+
+# AI generated files
+Claude*

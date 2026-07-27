@@ -1,8 +1,9 @@
 import batch_helper
-import json
+import meraki
 import pprint
 import re
 import sys
+import time
 from ciscoconfparse2 import CiscoConfParse
 from collections import defaultdict
 from mc_pedia2 import mc_pedia, nm_dict
@@ -12,6 +13,35 @@ try:
     from mc_user_info import DEBUG, DEBUG_TRANSLATOR
 except ImportError:
     DEBUG = DEBUG_TRANSLATOR = False
+
+# Set by merakicat.py --ignore-port-count. The source/target port count check
+# in MerakiConfig is an assertion about our own parsing, not about the
+# hardware, so a bad parse must not strand someone in the field.
+IGNORE_PORT_COUNT = False
+
+
+def set_ignore_port_count(value: bool) -> None:
+    """Let the front end downgrade the port count check to a warning."""
+    global IGNORE_PORT_COUNT
+    IGNORE_PORT_COUNT = bool(value)
+
+
+def is_physical_port_type(intf_type: str) -> bool:
+    """
+    Is this IOS XE interface type a physical switch port?
+
+    Matched by suffix rather than an explicit list because IOS XE names a port
+    after its speed, and the speed vocabulary keeps growing: a C9300-48UXM
+    calls its 2.5G mGig downlinks TwoGigabitEthernet and a C9300-48UN calls
+    its 5G ones FiveGigabitEthernet. Every type this misses is silently
+    dropped from translation - it lands in Other_list, which nothing reads -
+    and also breaks the port count check in MerakiConfig, so err toward
+    matching. AppGigabitEthernet is not a front-panel port, but it is already
+    filtered out before we get here.
+    :param intf_type: Interface name with digits and slashes stripped
+    :return: True for a front-panel port type
+    """
+    return intf_type.endswith(("Ethernet", "GigE"))
 
 
 def Evaluate(config_file, nm_list, unified_os):
@@ -31,6 +61,10 @@ def Evaluate(config_file, nm_list, unified_os):
     switch_dict = {}
     # List of interfaces that are shut
     shut_interfaces = list()
+    # Interfaces we could not split into a module/sub-module/port
+    unparsed_interfaces = list()
+    # Uplink/module ports left out because no uplink module was recognized
+    skipped_uplinks = list()
 
     def read_Cisco_SW():
         """
@@ -123,7 +157,14 @@ def Evaluate(config_file, nm_list, unified_os):
                             r"^interface\s\S+?GigE+(\d)"
                         )
                 port, sub_module = check(intf_name)
-                if sub_module == "1":
+                if sub_module == "":
+                    # check() couldn't find a module/sub-module/port in the
+                    # name (Tunnel, Bluetooth, a two-part GigabitEthernet0/1).
+                    # Meraki has nothing to map it to, so leave it out rather
+                    # than push a port with no number.
+                    unparsed_interfaces.append(intf_name)
+                    intf_include = False
+                elif sub_module == "1":
                     intf_include = False
                     if debug:
                         print(f"Switch_module = {Switch_module}")
@@ -144,6 +185,12 @@ def Evaluate(config_file, nm_list, unified_os):
                                                 + f"to {regex}\n"
                                             )
                                         break
+                    if not intf_include:
+                        # Dropped because no recognized uplink module holds it
+                        # or it carries no settings, so it never reaches
+                        # port_dict and can't show up in the port count
+                        # diagnostics. Remember it for the NOTE below.
+                        skipped_uplinks.append((Switch_module or "?", intf_name))
                 if intf_include:
                     # If we are including the interfaces, let's set a few
                     # default settings
@@ -223,6 +270,34 @@ def Evaluate(config_file, nm_list, unified_os):
                         port_dict[intf_name]["Port_Sec"] = max_mac
 
         Intf_list, Other_list = split_down_up_link(All_interfaces, Gig_uplink)
+        # Nothing downstream reads Other_list or the unparsed interfaces, so
+        # say out loud what we are dropping. A silently dropped downlink both
+        # goes unconfigured and throws off the port count check in
+        # MerakiConfig, which is a confusing way to find out about it.
+        dropped = [i for i in Other_list if not i.startswith("Port-channel")]
+        dropped += unparsed_interfaces
+        if dropped:
+            print(
+                f"NOTE: {len(dropped)} interface(s) in the config will not be "
+                + "translated because they are not front-panel switch ports: "
+                + ", ".join(dropped)
+            )
+        if skipped_uplinks:
+            # Per switch rather than by name: on a stack this is a dozen or
+            # more ports every run, and what matters when a port count comes
+            # up short is how many went where, not which ones.
+            per_switch = defaultdict(int)
+            for switch_module, _ in skipped_uplinks:
+                per_switch[switch_module] += 1
+            print(
+                f"NOTE: {len(skipped_uplinks)} uplink/module port(s) were not "
+                + "translated, having no recognized uplink module or no "
+                + "settings ("
+                + ", ".join(f"switch {sw}: {n}" for sw, n in sorted(per_switch.items()))
+                + ")."
+            )
+            if debug:
+                print(f"  skipped: {', '.join(n for _, n in skipped_uplinks)}")
         if debug:
             print(f"Intf_list = {Intf_list}\n")
             print(f"Other_list = {Other_list}\n")
@@ -247,17 +322,7 @@ def Evaluate(config_file, nm_list, unified_os):
             print(f"interfaces_list = {interfaces_list}\n")
         for key, value in interfaces_list.items():
             for value in interfaces_list_copy[key]:
-                if (
-                    key == "HundredGigabitEthernet"
-                    or key == "HundredGigE"
-                    or key == "FortyGigabitEthernet"
-                    or key == "TwentyFiveGigE"
-                    or key == "TenGigabitEthernet"
-                    or key == "FiveGigabitEthernet"
-                    or key == "GigabitEthernet"
-                    or key == "FastEthernet"
-                    or key == "Vlan"
-                ):
+                if key == "Vlan" or is_physical_port_type(key):
                     # pass
                     Intf_list.append(value)
                 else:
@@ -302,11 +367,22 @@ def Evaluate(config_file, nm_list, unified_os):
             Sub_module = obj.group(2)
         else:
             obj = re.search(r"(?:channel)(\d+)$", intf)
-            if debug:
-                print(f"obj.group(0) = {obj.group(0)}")
-                print(f"obj.group(1) = {obj.group(1)}")
-            port = obj.group(1)
-            Sub_module = 0
+            if obj is not None:
+                if debug:
+                    print(f"obj.group(0) = {obj.group(0)}")
+                    print(f"obj.group(1) = {obj.group(1)}")
+                port = obj.group(1)
+                Sub_module = 0
+            else:
+                # Neither module/sub-module/port nor Port-channel: a Tunnel,
+                # Bluetooth, or two-part name like GigabitEthernet0/1. Don't
+                # guess a port number - anything without a sub-module of "0"
+                # is left out of the port count and never configured, which is
+                # what we want for a non-front-panel interface.
+                if debug:
+                    print(f"Couldn't split {intf} into module/port.")
+                port = ""
+                Sub_module = ""
         return port, Sub_module
 
     Interfaces, Others, port_dict, switch_name = read_Cisco_SW()
@@ -314,6 +390,395 @@ def Evaluate(config_file, nm_list, unified_os):
         print(f"\nInterfaces = {Interfaces}")
         print(f"\nOthers = {Others}")
     return Interfaces, Others, port_dict, switch_dict
+
+
+# Meraki exposes ONE 'vlan' field on a switch port, and what it means depends on
+# the port type: native VLAN on a trunk, access VLAN on an access port.
+_VLAN_SOURCE_BY_TYPE = {"trunk": "nativeVlan", "access": "dataVlan"}
+
+
+def reconcile_port_vlan_args(port_args, intf_settings, port_label=""):
+    """
+    Make the 'vlan' and 'voiceVlan' args valid for this port's type.
+
+    The encyclopedia can't express either rule: 'nativeVlan' and 'dataVlan'
+    both map to meraki.field == 'vlan', so whichever key the pedia visits last
+    wins regardless of port type, and nothing gates 'voiceVlan' on the type at
+    all. Meraki rejects a voice VLAN on anything but an access port, and an
+    action batch is atomic - one rejected action discards the whole batch - so
+    a single mis-typed port silently loses every other port in the run.
+
+    :param port_args: The Meraki args dict for this port, modified in place
+    :param intf_settings: The port_dict entry for this interface
+    :param port_label: The interface descriptor, used in the returned notes
+    :return: List of human-readable notes about what was changed
+    """
+    notes = []
+    port_type = port_args.get("type") or intf_settings.get("type") or "trunk"
+
+    source_key = _VLAN_SOURCE_BY_TYPE.get(port_type)
+    if source_key:
+        value = intf_settings.get(source_key)
+        if value in (None, ""):
+            value = mc_pedia["port"][source_key]["meraki"].get("default", "1")
+        port_args["vlan"] = value
+
+    if port_type != "access" and port_args.get("voiceVlan") not in (None, ""):
+        notes.append(
+            f"{port_label}: dropped voice VLAN {port_args['voiceVlan']} - Meraki"
+            + " supports a voice VLAN on access ports only"
+        )
+        port_args.pop("voiceVlan", None)
+
+    return notes
+
+
+def validate_port_action_args(port_args, port_label=""):
+    """
+    Return the reasons Dashboard would reject this updateDeviceSwitchPort body.
+
+    Action batches are atomic, so an action Dashboard refuses takes every other
+    action in the batch down with it. Catching the known-invalid shapes here
+    costs us the one bad port instead of all of them.
+
+    :param port_args: The Meraki args dict for this port
+    :param port_label: The interface descriptor, used in the returned problems
+    :return: List of human-readable problems; empty means the port looks valid
+    """
+    problems = []
+    port_type = port_args.get("type")
+
+    if port_type not in ("access", "trunk", "stack"):
+        problems.append(f"{port_label}: invalid port type {port_type!r}")
+    if port_type != "access" and port_args.get("voiceVlan") not in (None, ""):
+        problems.append(f"{port_label}: voiceVlan is only valid on access ports")
+    if port_type != "trunk" and port_args.get("allowedVlans") not in (None, ""):
+        problems.append(f"{port_label}: allowedVlans is only valid on trunk ports")
+
+    sticky = port_args.get("stickyMacAllowList")
+    if sticky is not None and not isinstance(sticky, list):
+        problems.append(
+            f"{port_label}: stickyMacAllowList must be a list, got "
+            + f"{type(sticky).__name__}"
+        )
+
+    return problems
+
+
+# How long to keep asking Dashboard whether a submitted action batch landed.
+# Batches go in with confirmed=True, synchronous=False, so a status read taken
+# right after submission always shows completed=False, failed=False.
+BATCH_POLL_INTERVAL_SECONDS = 2.0
+BATCH_POLL_TIMEOUT_SECONDS = 300
+
+
+def wait_for_action_batches(
+    dashboard,
+    organization_id,
+    batch_ids,
+    timeout=None,
+    interval=None,
+):
+    """
+    Poll submitted action batches until each one reaches a terminal state.
+
+    :param dashboard: The Meraki dashboard API object
+    :param organization_id: The Meraki organization ID
+    :param batch_ids: List of action batch IDs to wait on
+    :param timeout: Seconds to keep polling; defaults to the module constant
+    :param interval: Seconds between rounds; defaults to the module constant
+    :return: (succeeded_ids, {failed_id: [errors]}, [still_pending_ids])
+    """
+    debug = DEBUG or DEBUG_TRANSLATOR
+
+    if timeout is None:
+        timeout = BATCH_POLL_TIMEOUT_SECONDS
+    if interval is None:
+        interval = BATCH_POLL_INTERVAL_SECONDS
+
+    pending = set(batch_ids)
+    succeeded = []
+    failed = {}
+    deadline = time.monotonic() + timeout
+
+    while pending and time.monotonic() < deadline:
+        for batch_id in sorted(pending):
+            try:
+                batch = dashboard.organizations.getOrganizationActionBatch(
+                    organization_id, batch_id
+                )
+            except meraki.APIError as api_exc:
+                failed[batch_id] = [f"could not read batch status: {api_exc}"]
+                pending.discard(batch_id)
+                continue
+            status = batch.get("status", {})
+            if debug:
+                print(f"Batch {batch_id} status = {status}")
+            if status.get("failed"):
+                failed[batch_id] = status.get("errors") or [
+                    "batch failed, but Dashboard returned no detail"
+                ]
+                pending.discard(batch_id)
+            elif status.get("completed"):
+                succeeded.append(batch_id)
+                pending.discard(batch_id)
+        if pending:
+            time.sleep(interval)
+
+    return succeeded, failed, sorted(pending)
+
+
+def reconcile_ports_against_batches(
+    dashboard,
+    organization_id,
+    batch_ids,
+    all_owners,
+    conf_ports,
+    unconf_ports,
+    actions_per_batch=100,
+):
+    """
+    Move ports out of conf_ports when their action batch did not apply.
+
+    conf_ports is built from the actions we managed to *construct*; the SDK's
+    batch helpers never touch the network, so nothing in it has been confirmed
+    by Dashboard. Batches are atomic, so every port carried by a failed batch
+    is unconfigured no matter how well its action was built.
+
+    :param dashboard: The Meraki dashboard API object
+    :param organization_id: The Meraki organization ID
+    :param batch_ids: Submitted batch IDs, in submission order
+    :param all_owners: (switch_num, port_id) per action, in the same order
+    :      :           the actions were handed to the batch helper
+    :param conf_ports: defaultdict(list) of ports we believe succeeded
+    :param unconf_ports: defaultdict(list) of ports we know did not
+    :param actions_per_batch: The helper's actions_per_new_batch value
+    :return: NONE - modifies conf_ports and unconf_ports in place
+    """
+    if not batch_ids:
+        return
+
+    if mc_meraki_dry_run.MERAKI_DRY_RUN:
+        print("[DRY-RUN] Not polling action batch status.")
+        return
+
+    print("Confirming with Dashboard that the action batches applied...")
+    succeeded, failed, still_pending = wait_for_action_batches(
+        dashboard, organization_id, batch_ids
+    )
+
+    if not failed and not still_pending:
+        return
+
+    debug_batches = DEBUG or DEBUG_TRANSLATOR
+
+    def _demote(batch_index, reason):
+        """Move every port carried by this batch into unconf_ports."""
+        start = batch_index * actions_per_batch
+        for switch_num, port_id in all_owners[start:start + actions_per_batch]:
+            if port_id in conf_ports[switch_num]:
+                conf_ports[switch_num].remove(port_id)
+            if port_id not in unconf_ports[switch_num]:
+                unconf_ports[switch_num].append(port_id)
+        if debug_batches:
+            print(f"Demoted the ports in batch {batch_index} ({reason}).")
+
+    for index, batch_id in enumerate(batch_ids):
+        if batch_id in failed:
+            print(
+                f"Dashboard rejected action batch {batch_id}. It was atomic, "
+                + "so none of the ports it carried were configured:"
+            )
+            for error in failed[batch_id]:
+                print(f"  - {error}")
+            _demote(index, "failed")
+        elif batch_id in still_pending:
+            print(
+                f"Action batch {batch_id} had still not finished after "
+                + f"{BATCH_POLL_TIMEOUT_SECONDS} seconds, so we cannot confirm "
+                + "its ports. Action batches have no Dashboard UI - check it "
+                + f"with GET /organizations/{organization_id}/actionBatches/"
+                + f"{batch_id}"
+            )
+            _demote(index, "unconfirmed")
+
+    if succeeded and (failed or still_pending):
+        print(f"{len(succeeded)} of {len(batch_ids)} action batches applied cleanly.")
+
+
+def model_port_count(model):
+    """
+    Best-effort front-panel port count for a Meraki or Catalyst model number.
+
+    Both vendors put the downlink count right after the first dash: MS225-48LP,
+    C9300-48UXM, C9200L-24PXG-4X. It is a convention, not a guarantee - a
+    C9200CX-8P-2X2G has more than 8 front-panel ports - so callers must treat
+    a disagreement as "look closer", not as fact.
+    :param model: Model string from the Dashboard inventory
+    :return: Port count as an int, or None if the model doesn't carry one
+    """
+    if not model:
+        return None
+    match = re.search(r"-(\d{1,2})", model)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def summarize_parsed_ports(port_dict, Intf_list):
+    """
+    Group the parsed Catalyst ports by stack member for the port count check.
+
+    :param port_dict: Dictionary of IOSXE ports and features from Evaluate
+    :param Intf_list: List of standard ports & L3 interfaces to configure
+    :return: Dict of switch number (1-based, int) -> dict with the downlink
+    :      : port names, the uplink/module port names we are skipping, and a
+    :      : per-interface-type count of the downlinks
+    """
+    summary = defaultdict(
+        lambda: {"downlinks": [], "uplinks": [], "types": defaultdict(int)}
+    )
+    for port in Intf_list:
+        if port.startswith("Vlan"):
+            continue
+        settings = port_dict[port]
+        try:
+            switch_num = int(settings.get("sw_module") or 1)
+        except ValueError:
+            switch_num = 1
+        entry = summary[switch_num]
+        if settings.get("sub_module") == "0":
+            entry["downlinks"].append(port)
+            entry["types"][re.sub(r"\d+|/", "", port)] += 1
+        else:
+            entry["uplinks"].append(port)
+    return summary
+
+
+def check_port_counts(
+    dashboard, organization_id, sw_list, port_dict, Intf_list, debug=False
+):
+    """
+    Confirm the Catalyst downlinks we parsed match the target Meraki switches.
+
+    A disagreement almost always means we mis-parsed the config rather than
+    that the hardware is wrong - especially when migrating a switch onto its
+    own Cloud ID, where source and target are the same physical box. So print
+    everything needed to tell the two apart instead of a bare one-liner: the
+    stack member to serial mapping, the model we compared against, and the
+    interfaces we counted, skipped, and dropped.
+    :param dashboard: Active Meraki dashboard API session to use
+    :param organization_id: Meraki Org ID the target switches live in
+    :param sw_list: List of Meraki switch serial numbers to configure
+    :param port_dict: Dictionary of IOSXE ports and features from Evaluate
+    :param Intf_list: List of standard ports & L3 interfaces to configure
+    :param debug: When True, print the parsed detail even when it all matches
+    :return: NONE - exits unless every switch matches or the check is ignored
+    """
+    summary = summarize_parsed_ports(port_dict, Intf_list)
+    if debug:
+        for switch_num in sorted(summary):
+            entry = summary[switch_num]
+            print(
+                f"switch {switch_num}: {len(entry['downlinks'])} downlinks "
+                + f"{dict(entry['types'])}, "
+                + f"{len(entry['uplinks'])} uplink/module ports"
+            )
+
+    rows = []
+    problems = []
+    for index, serial in enumerate(sw_list):
+        switch_num = index + 1
+        entry = summary.get(switch_num)
+        parsed = len(entry["downlinks"]) if entry else 0
+        try:
+            model = dashboard.organizations.getOrganizationInventoryDevice(
+                organization_id, serial
+            )["model"]
+        except Exception as error:
+            print(
+                f"Couldn't look up serial number {serial} in org "
+                + f"{organization_id}: {error}"
+            )
+            print(
+                "That serial has to be claimed into this organization before "
+                + "we can translate to it."
+            )
+            sys.exit()
+        port_max = model_port_count(model)
+        rows.append((switch_num, serial, model, port_max, parsed))
+        if port_max is None:
+            problems.append(
+                f"Switch {switch_num} ({serial}, {model}): couldn't read a "
+                + "port count out of the model number, so we can't check it."
+            )
+        elif port_max != parsed:
+            problems.append(
+                f"Switch {switch_num} ({serial}) is a {model} with {port_max} "
+                + f"ports, but we parsed {parsed} port(s) for switch "
+                + f"{switch_num} out of the Catalyst config."
+            )
+
+    # Config referring to stack members we have no target switch for is its
+    # own failure, and a likely cause of a count of 0 above.
+    extra = [num for num in sorted(summary) if num > len(sw_list)]
+    if extra:
+        problems.append(
+            "The Catalyst config has ports on switch(es) "
+            + ", ".join(str(num) for num in extra)
+            + f", but only {len(sw_list)} target serial number(s) were given: "
+            + ", ".join(str(s) for s in sw_list)
+        )
+
+    if not problems:
+        return
+
+    print("\nPort count check failed:")
+    for problem in problems:
+        print(f"  - {problem}")
+    print("\nWhat we parsed out of the Catalyst config:")
+    for switch_num, serial, model, port_max, parsed in rows:
+        entry = summary.get(switch_num) or {"types": {}, "uplinks": []}
+        print(
+            f"  switch {switch_num}  serial {serial}  model {model}  "
+            + f"model ports {port_max}  parsed downlinks {parsed}"
+        )
+        if entry["types"]:
+            types = ", ".join(f"{k} x{v}" for k, v in sorted(entry["types"].items()))
+            print(f"      counted by type: {types}")
+        if entry["uplinks"]:
+            print(
+                "      skipped as uplink/module ports: "
+                + ", ".join(entry["uplinks"])
+            )
+    for switch_num in sorted(summary):
+        if switch_num > len(sw_list):
+            entry = summary[switch_num]
+            print(
+                f"  switch {switch_num}  NO TARGET SERIAL  "
+                + f"parsed downlinks {len(entry['downlinks'])}"
+            )
+    print(
+        "\nUsual causes, most common first:\n"
+        + "  1. A port type we don't recognize, so its ports were dropped -\n"
+        + "     look for a NOTE about untranslated interfaces above.\n"
+        + "  2. A mixed-model stack whose serial numbers were given in a\n"
+        + "     different order than the switch numbers in the config.\n"
+        + "  3. A partial 'show running-config' capture, so some interfaces\n"
+        + "     never made it into the .cfg file in the files folder.\n"
+        + "  4. A model whose port count isn't the number in its name.\n"
+    )
+    if IGNORE_PORT_COUNT:
+        print(
+            "Continuing anyway because --ignore-port-count was given. Ports "
+            + "we didn't parse will not be configured.\n"
+        )
+        return
+    print(
+        "Stopping. Re-run with --ignore-port-count to translate the ports we "
+        + "did parse, or with DEBUG_TRANSLATOR set for the full parse.\n"
+    )
+    sys.exit()
 
 
 def MerakiConfig(
@@ -348,43 +813,16 @@ def MerakiConfig(
 
     # Make sure that the switches we are translating to have the same
     # number of ports
-    sw_check_list = list()
-    for serial in sw_list:
-        sw_check_list.append({"serial": serial, "ports": 0})
-    for port in Intf_list:
-        if not port.startswith("Vlan"):
-            if debug:
-                print(f"port = {port}")
-                print(f"port_dict[port] = {port_dict[port]}")
-            if port_dict[port]["sub_module"] == "0":
-                sw_check_list[int(port_dict[port]["sw_module"]) - 1]["ports"] += 1
-    if debug:
-        print(f"sw_check_list = {sw_check_list}")
-    for sw in sw_check_list:
-        try:
-            model = dashboard.organizations.getOrganizationInventoryDevice(
-                organization_id, sw["serial"]
-            )["model"]
-            if debug:
-                print(f"model = {model}")
-        except:
-            print("Couldn't get switch ports for serial number: " + f"{sw['serial']}.")
-            sys.exit()
-        port_max = int(re.search(r"-(\d{1,2})", model).group(1))
-        if debug:
-            print(
-                f"Switch with serial number {sw['serial']} has " + f"{port_max} ports."
-            )
-        if not port_max == sw["ports"]:
-            print(
-                f"Switch with serial number {sw['serial']} has {port_max} "
-                + f"ports, not {sw['ports']}!"
-            )
-            sys.exit()
+    check_port_counts(dashboard, organization_id, sw_list, port_dict, Intf_list, debug)
 
     # Create batch action lists
     action_list = list()
     all_actions = list()
+    # Kept in lockstep with action_list / all_actions so that when a batch
+    # fails we can name the ports it was carrying. Each entry is
+    # (switch_num, port_id) for the action at the same index.
+    owner_list = list()
+    all_owners = list()
     returns_dict = {}
     post_ports_list = list()
     # Create good and bad port lists
@@ -563,6 +1001,19 @@ def MerakiConfig(
                                 if debug:
                                     print("post_ports_list = " + f"{post_ports_list}")
                                 n += 1
+
+                # The pedia loop above is key-ordered, not type-aware, so fix
+                # up the port-type-dependent args now that every key has run.
+                vlan_notes = reconcile_port_vlan_args(
+                    args[y][2], intf_settings, interface_descriptor
+                )
+                for note in vlan_notes:
+                    print(f"Note: {note}")
+                if vlan_notes:
+                    intf_settings.setdefault("translation_notes", []).extend(
+                        vlan_notes
+                    )
+
                 try:
                     # If port was disabled, disable it in the port)_dict
                     args[y][2].update(
@@ -592,7 +1043,8 @@ def MerakiConfig(
                         args[y][2].update(
                             {
                                 "accessPolicyType": "Sticky MAC allow list",
-                                "stickyMacAllowList": json.dumps(intf_settings["mac"]),
+                                # The API wants an array here, not a JSON string
+                                "stickyMacAllowList": intf_settings["mac"],
                                 "stickyMacAllowListLimit": mac_limit,
                             }
                         )
@@ -693,23 +1145,36 @@ def MerakiConfig(
             if not len(action_list) == switch_num + 1:
                 # We are on to the next switch, so I want a new sublist
                 action_list.append([])
+                owner_list.append([])
             # If it's a physical interface,
             # Add this action to the action_list sublist for the switch
             if "Vlan" not in interface_descriptor:
-                try:
-                    action_list[switch_num].append(
-                        dashboard.batch.switch.updateDeviceSwitchPort(
-                            args[y][0], args[y][1], **args[y][2]
-                        )
-                    )
-                except:
+                # An action batch is all-or-nothing, so a port Dashboard would
+                # reject costs us every other port in the batch. Leave it out
+                # and report it rather than gamble the whole run on it.
+                problems = validate_port_action_args(
+                    args[y][2], interface_descriptor
+                )
+                if problems:
+                    for problem in problems:
+                        print(f"Not translating {problem}")
                     unconf_ports[switch_num].append(args[y][1])
-                    print(
-                        "We caught an exception configuring "
-                        + f"{args[y][1]} on {switch_num}"
-                    )
-                if not args[y][1] in unconf_ports[switch_num]:
-                    conf_ports[switch_num].append(args[y][1])
+                else:
+                    try:
+                        action_list[switch_num].append(
+                            dashboard.batch.switch.updateDeviceSwitchPort(
+                                args[y][0], args[y][1], **args[y][2]
+                            )
+                        )
+                        owner_list[switch_num].append((switch_num, args[y][1]))
+                    except Exception as action_exc:
+                        unconf_ports[switch_num].append(args[y][1])
+                        print(
+                            "We caught an exception configuring "
+                            + f"{args[y][1]} on {switch_num}: {action_exc}"
+                        )
+                    if not args[y][1] in unconf_ports[switch_num]:
+                        conf_ports[switch_num].append(args[y][1])
             y += 1
 
         # post_ports processing
@@ -734,13 +1199,22 @@ def MerakiConfig(
                 # there is one in the PORTS section of the encyclopedia
                 newvals = {}
                 if short_list[item] in mc_pedia["port"].keys():
-                    exec(
-                        mc_pedia["port"][short_list[item]]["meraki"].get(
-                            "post_ports_process"
-                        ),
-                        locals(),
-                        newvals,
-                    )
+                    try:
+                        exec(
+                            mc_pedia["port"][short_list[item]]["meraki"].get(
+                                "post_ports_process"
+                            ),
+                            locals(),
+                            newvals,
+                        )
+                    except Exception as pp_exc:
+                        # The encyclopedia is exec'd source that can be
+                        # replaced from upstream underneath us, so never let
+                        # one bad snippet take down the whole translation.
+                        print(
+                            "We caught an exception in the post-port process "
+                            + f"for {short_list[item]}: {pp_exc}"
+                        )
                     if "return_vals" in newvals:
                         return_vals = newvals["return_vals"]
                         if "channel_port_dict" in return_vals and "channel_port_dict" in newvals:
@@ -808,6 +1282,10 @@ def MerakiConfig(
     x = 0
     while x <= len(action_list) - 1:
         all_actions.extend(action_list[x])
+        # Flattened in the same order as all_actions, so all_owners[i] is the
+        # (switch_num, port_id) that produced all_actions[i]
+        if x <= len(owner_list) - 1:
+            all_owners.extend(owner_list[x])
         x += 1
     if debug:
         print(f"all_actions = {all_actions}")
@@ -829,41 +1307,36 @@ def MerakiConfig(
         linear_new_batches=False,
         actions_per_new_batch=100,
     )
+    # prepare() only groups actions locally - no API traffic - so it is safe
+    # to run in either mode.
     test_helper.prepare()
     # test_helper.generate_preview()
-    test_helper.execute()
+    if mc_meraki_dry_run.MERAKI_DRY_RUN:
+        # execute() polls the live action batch queue before submitting, which
+        # is pointless when the submission itself is going to be swallowed and
+        # needs org-level API rights the run may not have. Report instead.
+        print(
+            f"[DRY-RUN] Not submitting {len(all_actions)} port action(s) in "
+            + f"{len(test_helper.new_batches)} action batch(es)."
+        )
+    else:
+        test_helper.execute()
     if debug:
         print(f"helper status is {test_helper.status}")
 
-    # try:
-    batches_report = dashboard.organizations.getOrganizationActionBatches(
-        organization_id
+    # conf_ports so far only records that we could *build* each action -
+    # dashboard.batch.* never touches the network. Batches are submitted
+    # asynchronously and are atomic, so reconcile against what Dashboard
+    # actually did with them before we claim any of these ports succeeded.
+    reconcile_ports_against_batches(
+        dashboard,
+        organization_id,
+        test_helper.submitted_new_batches_ids,
+        all_owners,
+        conf_ports,
+        unconf_ports,
+        actions_per_batch=100,
     )
-    # except:
-    #    pass
-    new_batches_statuses = [
-        {"id": batch["id"], "status": batch["status"]}
-        for batch in batches_report
-        if batch["id"] in test_helper.submitted_new_batches_ids
-    ]
-    if debug:
-        print(f"Batch status returned is: {new_batches_statuses}")
-    failed_batch_ids = [
-        batch["id"] for batch in new_batches_statuses if batch["status"]["failed"]
-    ]
-    if failed_batch_ids:
-        # A batch can be built and submitted successfully but still fail to
-        # apply server-side; conf_ports/unconf_ports above only reflect
-        # whether we could build the actions locally, so surface batch
-        # failures explicitly here rather than silently reporting success.
-        print(
-            "Warning: one or more Dashboard action batches failed to apply: "
-            + f"{failed_batch_ids}. Some ports reported as translated above "
-            + "may not actually be configured - check the batch(es) in "
-            + "Dashboard under Organization > Action batches."
-        )
-    if debug:
-        print(f"Failed batch IDs are as follows: {failed_batch_ids}")
 
     if debug:
         print(f"\nport_dict = {port_dict}\n")
