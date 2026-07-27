@@ -521,7 +521,9 @@ def reconcile_ports_against_batches(
             print(
                 f"Action batch {batch_id} had still not finished after "
                 + f"{BATCH_POLL_TIMEOUT_SECONDS} seconds, so we cannot confirm "
-                + "its ports. Check Organization > Action batches in Dashboard."
+                + "its ports. Action batches have no Dashboard UI - check it "
+                + f"with GET /organizations/{organization_id}/actionBatches/"
+                + f"{batch_id}"
             )
             _demote(index, "unconfirmed")
 
@@ -1087,9 +1089,20 @@ def MerakiConfig(
         linear_new_batches=False,
         actions_per_new_batch=100,
     )
+    # prepare() only groups actions locally - no API traffic - so it is safe
+    # to run in either mode.
     test_helper.prepare()
     # test_helper.generate_preview()
-    test_helper.execute()
+    if mc_meraki_dry_run.MERAKI_DRY_RUN:
+        # execute() polls the live action batch queue before submitting, which
+        # is pointless when the submission itself is going to be swallowed and
+        # needs org-level API rights the run may not have. Report instead.
+        print(
+            f"[DRY-RUN] Not submitting {len(all_actions)} port action(s) in "
+            + f"{len(test_helper.new_batches)} action batch(es)."
+        )
+    else:
+        test_helper.execute()
     if debug:
         print(f"helper status is {test_helper.status}")
 

@@ -613,6 +613,18 @@ if len(stack) == 1:
             'iosxe': "multicast_pim = parse.find_objects('^ip\spim')"
         },
 
+        'ip_routing':{
+            'name': "IP routing",
+            'support':"✓",
+            'translatable':"",
+            'regex': '^ip\srouting',
+            'iosxe': "ip_routing = parse.find_objects('^ip\srouting')",
+            'note': "Detection only - gates whether SVIs become Meraki L3 interfaces",
+            'meraki':{
+                'skip': True
+                }
+        },
+
         'static_routing':{
             'name': "Static routing",
             'support':"✓",
@@ -954,6 +966,19 @@ payload = {}
 l3_ports = [v for k, v in port_dict.items() if 'Vlan' in k]
 if debug:
     print(f'l3_ports = {l3_ports}')
+if l3_ports and not switch_dict.get('ip_routing'):
+    # No 'ip routing' in the source config means this is a Layer 2 switch and
+    # its SVI is a management address, not a routed interface. A Meraki stack
+    # routing interface is for inter-VLAN routing, so creating one here would
+    # enable behaviour the Catalyst never had. Report and skip instead; the
+    # management IP belongs on the device's management interface.
+    for l3_port in l3_ports:
+        l3_name = l3_port['meraki_args'][2]
+        print(f"Skipping {l3_name}: the source config has no 'ip routing', so this")
+        print("    SVI is a management address rather than a routed interface. Set")
+        print("    the switch management IP in Dashboard instead.")
+        unconf_ports.append(l3_name)
+    l3_ports = []
 # Index of the SVI that carries the default gateway. Stays None when no SVI
 # does, so the second loop below can still tell 'not yet found' from a match.
 dg = None
