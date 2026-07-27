@@ -86,6 +86,10 @@ from webex_bot.models.command import Command
 from webex_bot.models.response import Response
 from webex_bot.webex_bot import WebexBot
 
+# A file carrying this marker has fork-local changes that are not upstream,
+# so init_mc_pedia() leaves it alone rather than downloading over it.
+FORK_LOCAL_MARKER = "MERAKICAT-FORK-LOCAL"
+
 # Populated by initialize_merakicat() from main().
 MERAKI_DRY_RUN = False
 FORCE_PEDIA_REFRESH = False
@@ -2903,7 +2907,22 @@ def get_repo_file_commit_epoch(file_path: str) -> float | None:
 
 def should_download_repo_file(local_file: str, repo_file: str) -> bool:
     """Return True only when local file is missing or older than the repo copy."""
-    if FORCE_PEDIA_REFRESH or not os.path.exists(local_file):
+    if not os.path.exists(local_file):
+        return True
+
+    # Checked ahead of FORCE_PEDIA_REFRESH on purpose: a file this fork has
+    # deliberately diverged from upstream must survive --force-pedia-refresh
+    # too, or the refresh silently reverts fixes that aren't upstream yet.
+    try:
+        with open(local_file, encoding="utf-8") as marker_file:
+            if FORK_LOCAL_MARKER in marker_file.read(4096):
+                if debug:
+                    print(f"{local_file} is fork-local; not overwriting it.")
+                return False
+    except OSError:
+        pass
+
+    if FORCE_PEDIA_REFRESH:
         return True
 
     repo_commit_epoch = get_repo_file_commit_epoch(repo_file)
@@ -3048,8 +3067,14 @@ def init_dashboard_and_meraki_org():
     global meraki_orgs, meraki_networks, meraki_org
     if debug:
         print("Trying to setup a dashboard instance")
+    # Quiet by default, but keep the SDK's own diagnostics reachable: with
+    # logging suppressed the body of a 4xx from Dashboard is discarded, which
+    # is how a failed config push can look like a clean run.
     dashboard_api = meraki.DashboardAPI(
-        api_key=meraki_api_key, output_log=False, suppress_logging=True
+        api_key=meraki_api_key,
+        output_log=False,
+        print_console=debug,
+        suppress_logging=not debug,
     )
     if MERAKI_DRY_RUN:
         apply_dry_run_session(dashboard_api)

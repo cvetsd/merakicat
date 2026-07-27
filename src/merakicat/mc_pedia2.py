@@ -1,5 +1,10 @@
 import sys
 
+# MERAKICAT-FORK-LOCAL: this encyclopedia carries fork-specific fixes that are
+# not upstream (the dataVlan regex, the nativeVlan/dataVlan 'field' mappings,
+# and the L3 interface creation calls). init_mc_pedia() must not overwrite it
+# with the copy from ecoen66/merakicat. See CLAUDE.md.
+
 '''
 #####################################################################################
 
@@ -949,6 +954,9 @@ payload = {}
 l3_ports = [v for k, v in port_dict.items() if 'Vlan' in k]
 if debug:
     print(f'l3_ports = {l3_ports}')
+# Index of the SVI that carries the default gateway. Stays None when no SVI
+# does, so the second loop below can still tell 'not yet found' from a match.
+dg = None
 x = 0
 while x < len(l3_ports):
     if debug:
@@ -959,7 +967,10 @@ while x < len(l3_ports):
     if 'defaultGateway' in ma[4].keys():
         try:
             if 'switchStackId' in switch_dict:
-                dashboard.switch.createNetworkSwitchStackRoutingInterface(ma[0],ma[1],ma[2],ma[3],**ma[4])
+                # name/vlanId by keyword: meraki 1.46 declares vlanId as a
+                # positional param, 2.0.3+ takes it in **kwargs. Keywords bind
+                # on both; four positional args only work on 1.46.
+                dashboard.switch.createNetworkSwitchStackRoutingInterface(ma[0],ma[1],name=ma[2],vlanId=ma[3],**ma[4])
             else:
                 if unified_os:
                     import requests
@@ -999,11 +1010,20 @@ while x < len(l3_ports):
     x+=1
 x = 0
 while x < len(l3_ports):
-    if not x == dg:
+    if x != dg:
         ma = l3_ports[x]['meraki_args']
+        if 'interfaceIp' not in ma[4]:
+            # A shutdown or IP-less SVI (e.g. an unused 'interface Vlan1') has
+            # nothing Dashboard can create, so say so instead of POSTing a
+            # request we know will fail.
+            print(f'Skipping {ma[2]}: no IP address configured in the source config.')
+            unconf_ports.append(ma[2])
+            x+=1
+            continue
         try:
             if 'switchStackId' in switch_dict.keys():
-                dashboard.switch.createNetworkSwitchStackRoutingInterface(ma[0],ma[1],ma[2],ma[3],**ma[4])
+                # See the keyword note on the matching call above.
+                dashboard.switch.createNetworkSwitchStackRoutingInterface(ma[0],ma[1],name=ma[2],vlanId=ma[3],**ma[4])
             else:
                 dashboard.switch.createDeviceSwitchRoutingInterface(sw_list[0],name=ma[2],vlanId=ma[3],**ma[4])
             conf_ports.append(ma[2])

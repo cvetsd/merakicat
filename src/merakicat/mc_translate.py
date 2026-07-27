@@ -1,8 +1,9 @@
 import batch_helper
-import json
+import meraki
 import pprint
 import re
 import sys
+import time
 from ciscoconfparse2 import CiscoConfParse
 from collections import defaultdict
 from mc_pedia2 import mc_pedia, nm_dict
@@ -316,6 +317,218 @@ def Evaluate(config_file, nm_list, unified_os):
     return Interfaces, Others, port_dict, switch_dict
 
 
+# Meraki exposes ONE 'vlan' field on a switch port, and what it means depends on
+# the port type: native VLAN on a trunk, access VLAN on an access port.
+_VLAN_SOURCE_BY_TYPE = {"trunk": "nativeVlan", "access": "dataVlan"}
+
+
+def reconcile_port_vlan_args(port_args, intf_settings, port_label=""):
+    """
+    Make the 'vlan' and 'voiceVlan' args valid for this port's type.
+
+    The encyclopedia can't express either rule: 'nativeVlan' and 'dataVlan'
+    both map to meraki.field == 'vlan', so whichever key the pedia visits last
+    wins regardless of port type, and nothing gates 'voiceVlan' on the type at
+    all. Meraki rejects a voice VLAN on anything but an access port, and an
+    action batch is atomic - one rejected action discards the whole batch - so
+    a single mis-typed port silently loses every other port in the run.
+
+    :param port_args: The Meraki args dict for this port, modified in place
+    :param intf_settings: The port_dict entry for this interface
+    :param port_label: The interface descriptor, used in the returned notes
+    :return: List of human-readable notes about what was changed
+    """
+    notes = []
+    port_type = port_args.get("type") or intf_settings.get("type") or "trunk"
+
+    source_key = _VLAN_SOURCE_BY_TYPE.get(port_type)
+    if source_key:
+        value = intf_settings.get(source_key)
+        if value in (None, ""):
+            value = mc_pedia["port"][source_key]["meraki"].get("default", "1")
+        port_args["vlan"] = value
+
+    if port_type != "access" and port_args.get("voiceVlan") not in (None, ""):
+        notes.append(
+            f"{port_label}: dropped voice VLAN {port_args['voiceVlan']} - Meraki"
+            + " supports a voice VLAN on access ports only"
+        )
+        port_args.pop("voiceVlan", None)
+
+    return notes
+
+
+def validate_port_action_args(port_args, port_label=""):
+    """
+    Return the reasons Dashboard would reject this updateDeviceSwitchPort body.
+
+    Action batches are atomic, so an action Dashboard refuses takes every other
+    action in the batch down with it. Catching the known-invalid shapes here
+    costs us the one bad port instead of all of them.
+
+    :param port_args: The Meraki args dict for this port
+    :param port_label: The interface descriptor, used in the returned problems
+    :return: List of human-readable problems; empty means the port looks valid
+    """
+    problems = []
+    port_type = port_args.get("type")
+
+    if port_type not in ("access", "trunk", "stack"):
+        problems.append(f"{port_label}: invalid port type {port_type!r}")
+    if port_type != "access" and port_args.get("voiceVlan") not in (None, ""):
+        problems.append(f"{port_label}: voiceVlan is only valid on access ports")
+    if port_type != "trunk" and port_args.get("allowedVlans") not in (None, ""):
+        problems.append(f"{port_label}: allowedVlans is only valid on trunk ports")
+
+    sticky = port_args.get("stickyMacAllowList")
+    if sticky is not None and not isinstance(sticky, list):
+        problems.append(
+            f"{port_label}: stickyMacAllowList must be a list, got "
+            + f"{type(sticky).__name__}"
+        )
+
+    return problems
+
+
+# How long to keep asking Dashboard whether a submitted action batch landed.
+# Batches go in with confirmed=True, synchronous=False, so a status read taken
+# right after submission always shows completed=False, failed=False.
+BATCH_POLL_INTERVAL_SECONDS = 2.0
+BATCH_POLL_TIMEOUT_SECONDS = 300
+
+
+def wait_for_action_batches(
+    dashboard,
+    organization_id,
+    batch_ids,
+    timeout=None,
+    interval=None,
+):
+    """
+    Poll submitted action batches until each one reaches a terminal state.
+
+    :param dashboard: The Meraki dashboard API object
+    :param organization_id: The Meraki organization ID
+    :param batch_ids: List of action batch IDs to wait on
+    :param timeout: Seconds to keep polling; defaults to the module constant
+    :param interval: Seconds between rounds; defaults to the module constant
+    :return: (succeeded_ids, {failed_id: [errors]}, [still_pending_ids])
+    """
+    debug = DEBUG or DEBUG_TRANSLATOR
+
+    if timeout is None:
+        timeout = BATCH_POLL_TIMEOUT_SECONDS
+    if interval is None:
+        interval = BATCH_POLL_INTERVAL_SECONDS
+
+    pending = set(batch_ids)
+    succeeded = []
+    failed = {}
+    deadline = time.monotonic() + timeout
+
+    while pending and time.monotonic() < deadline:
+        for batch_id in sorted(pending):
+            try:
+                batch = dashboard.organizations.getOrganizationActionBatch(
+                    organization_id, batch_id
+                )
+            except meraki.APIError as api_exc:
+                failed[batch_id] = [f"could not read batch status: {api_exc}"]
+                pending.discard(batch_id)
+                continue
+            status = batch.get("status", {})
+            if debug:
+                print(f"Batch {batch_id} status = {status}")
+            if status.get("failed"):
+                failed[batch_id] = status.get("errors") or [
+                    "batch failed, but Dashboard returned no detail"
+                ]
+                pending.discard(batch_id)
+            elif status.get("completed"):
+                succeeded.append(batch_id)
+                pending.discard(batch_id)
+        if pending:
+            time.sleep(interval)
+
+    return succeeded, failed, sorted(pending)
+
+
+def reconcile_ports_against_batches(
+    dashboard,
+    organization_id,
+    batch_ids,
+    all_owners,
+    conf_ports,
+    unconf_ports,
+    actions_per_batch=100,
+):
+    """
+    Move ports out of conf_ports when their action batch did not apply.
+
+    conf_ports is built from the actions we managed to *construct*; the SDK's
+    batch helpers never touch the network, so nothing in it has been confirmed
+    by Dashboard. Batches are atomic, so every port carried by a failed batch
+    is unconfigured no matter how well its action was built.
+
+    :param dashboard: The Meraki dashboard API object
+    :param organization_id: The Meraki organization ID
+    :param batch_ids: Submitted batch IDs, in submission order
+    :param all_owners: (switch_num, port_id) per action, in the same order
+    :      :           the actions were handed to the batch helper
+    :param conf_ports: defaultdict(list) of ports we believe succeeded
+    :param unconf_ports: defaultdict(list) of ports we know did not
+    :param actions_per_batch: The helper's actions_per_new_batch value
+    :return: NONE - modifies conf_ports and unconf_ports in place
+    """
+    if not batch_ids:
+        return
+
+    if mc_meraki_dry_run.MERAKI_DRY_RUN:
+        print("[DRY-RUN] Not polling action batch status.")
+        return
+
+    print("Confirming with Dashboard that the action batches applied...")
+    succeeded, failed, still_pending = wait_for_action_batches(
+        dashboard, organization_id, batch_ids
+    )
+
+    if not failed and not still_pending:
+        return
+
+    debug_batches = DEBUG or DEBUG_TRANSLATOR
+
+    def _demote(batch_index, reason):
+        """Move every port carried by this batch into unconf_ports."""
+        start = batch_index * actions_per_batch
+        for switch_num, port_id in all_owners[start:start + actions_per_batch]:
+            if port_id in conf_ports[switch_num]:
+                conf_ports[switch_num].remove(port_id)
+            if port_id not in unconf_ports[switch_num]:
+                unconf_ports[switch_num].append(port_id)
+        if debug_batches:
+            print(f"Demoted the ports in batch {batch_index} ({reason}).")
+
+    for index, batch_id in enumerate(batch_ids):
+        if batch_id in failed:
+            print(
+                f"Dashboard rejected action batch {batch_id}. It was atomic, "
+                + "so none of the ports it carried were configured:"
+            )
+            for error in failed[batch_id]:
+                print(f"  - {error}")
+            _demote(index, "failed")
+        elif batch_id in still_pending:
+            print(
+                f"Action batch {batch_id} had still not finished after "
+                + f"{BATCH_POLL_TIMEOUT_SECONDS} seconds, so we cannot confirm "
+                + "its ports. Check Organization > Action batches in Dashboard."
+            )
+            _demote(index, "unconfirmed")
+
+    if succeeded and (failed or still_pending):
+        print(f"{len(succeeded)} of {len(batch_ids)} action batches applied cleanly.")
+
+
 def MerakiConfig(
     dashboard,
     organization_id,
@@ -385,6 +598,11 @@ def MerakiConfig(
     # Create batch action lists
     action_list = list()
     all_actions = list()
+    # Kept in lockstep with action_list / all_actions so that when a batch
+    # fails we can name the ports it was carrying. Each entry is
+    # (switch_num, port_id) for the action at the same index.
+    owner_list = list()
+    all_owners = list()
     returns_dict = {}
     post_ports_list = list()
     # Create good and bad port lists
@@ -563,6 +781,19 @@ def MerakiConfig(
                                 if debug:
                                     print("post_ports_list = " + f"{post_ports_list}")
                                 n += 1
+
+                # The pedia loop above is key-ordered, not type-aware, so fix
+                # up the port-type-dependent args now that every key has run.
+                vlan_notes = reconcile_port_vlan_args(
+                    args[y][2], intf_settings, interface_descriptor
+                )
+                for note in vlan_notes:
+                    print(f"Note: {note}")
+                if vlan_notes:
+                    intf_settings.setdefault("translation_notes", []).extend(
+                        vlan_notes
+                    )
+
                 try:
                     # If port was disabled, disable it in the port)_dict
                     args[y][2].update(
@@ -592,7 +823,8 @@ def MerakiConfig(
                         args[y][2].update(
                             {
                                 "accessPolicyType": "Sticky MAC allow list",
-                                "stickyMacAllowList": json.dumps(intf_settings["mac"]),
+                                # The API wants an array here, not a JSON string
+                                "stickyMacAllowList": intf_settings["mac"],
                                 "stickyMacAllowListLimit": mac_limit,
                             }
                         )
@@ -693,23 +925,36 @@ def MerakiConfig(
             if not len(action_list) == switch_num + 1:
                 # We are on to the next switch, so I want a new sublist
                 action_list.append([])
+                owner_list.append([])
             # If it's a physical interface,
             # Add this action to the action_list sublist for the switch
             if "Vlan" not in interface_descriptor:
-                try:
-                    action_list[switch_num].append(
-                        dashboard.batch.switch.updateDeviceSwitchPort(
-                            args[y][0], args[y][1], **args[y][2]
-                        )
-                    )
-                except:
+                # An action batch is all-or-nothing, so a port Dashboard would
+                # reject costs us every other port in the batch. Leave it out
+                # and report it rather than gamble the whole run on it.
+                problems = validate_port_action_args(
+                    args[y][2], interface_descriptor
+                )
+                if problems:
+                    for problem in problems:
+                        print(f"Not translating {problem}")
                     unconf_ports[switch_num].append(args[y][1])
-                    print(
-                        "We caught an exception configuring "
-                        + f"{args[y][1]} on {switch_num}"
-                    )
-                if not args[y][1] in unconf_ports[switch_num]:
-                    conf_ports[switch_num].append(args[y][1])
+                else:
+                    try:
+                        action_list[switch_num].append(
+                            dashboard.batch.switch.updateDeviceSwitchPort(
+                                args[y][0], args[y][1], **args[y][2]
+                            )
+                        )
+                        owner_list[switch_num].append((switch_num, args[y][1]))
+                    except Exception as action_exc:
+                        unconf_ports[switch_num].append(args[y][1])
+                        print(
+                            "We caught an exception configuring "
+                            + f"{args[y][1]} on {switch_num}: {action_exc}"
+                        )
+                    if not args[y][1] in unconf_ports[switch_num]:
+                        conf_ports[switch_num].append(args[y][1])
             y += 1
 
         # post_ports processing
@@ -734,13 +979,22 @@ def MerakiConfig(
                 # there is one in the PORTS section of the encyclopedia
                 newvals = {}
                 if short_list[item] in mc_pedia["port"].keys():
-                    exec(
-                        mc_pedia["port"][short_list[item]]["meraki"].get(
-                            "post_ports_process"
-                        ),
-                        locals(),
-                        newvals,
-                    )
+                    try:
+                        exec(
+                            mc_pedia["port"][short_list[item]]["meraki"].get(
+                                "post_ports_process"
+                            ),
+                            locals(),
+                            newvals,
+                        )
+                    except Exception as pp_exc:
+                        # The encyclopedia is exec'd source that can be
+                        # replaced from upstream underneath us, so never let
+                        # one bad snippet take down the whole translation.
+                        print(
+                            "We caught an exception in the post-port process "
+                            + f"for {short_list[item]}: {pp_exc}"
+                        )
                     if "return_vals" in newvals:
                         return_vals = newvals["return_vals"]
                         if "channel_port_dict" in return_vals and "channel_port_dict" in newvals:
@@ -808,6 +1062,10 @@ def MerakiConfig(
     x = 0
     while x <= len(action_list) - 1:
         all_actions.extend(action_list[x])
+        # Flattened in the same order as all_actions, so all_owners[i] is the
+        # (switch_num, port_id) that produced all_actions[i]
+        if x <= len(owner_list) - 1:
+            all_owners.extend(owner_list[x])
         x += 1
     if debug:
         print(f"all_actions = {all_actions}")
@@ -835,35 +1093,19 @@ def MerakiConfig(
     if debug:
         print(f"helper status is {test_helper.status}")
 
-    # try:
-    batches_report = dashboard.organizations.getOrganizationActionBatches(
-        organization_id
+    # conf_ports so far only records that we could *build* each action -
+    # dashboard.batch.* never touches the network. Batches are submitted
+    # asynchronously and are atomic, so reconcile against what Dashboard
+    # actually did with them before we claim any of these ports succeeded.
+    reconcile_ports_against_batches(
+        dashboard,
+        organization_id,
+        test_helper.submitted_new_batches_ids,
+        all_owners,
+        conf_ports,
+        unconf_ports,
+        actions_per_batch=100,
     )
-    # except:
-    #    pass
-    new_batches_statuses = [
-        {"id": batch["id"], "status": batch["status"]}
-        for batch in batches_report
-        if batch["id"] in test_helper.submitted_new_batches_ids
-    ]
-    if debug:
-        print(f"Batch status returned is: {new_batches_statuses}")
-    failed_batch_ids = [
-        batch["id"] for batch in new_batches_statuses if batch["status"]["failed"]
-    ]
-    if failed_batch_ids:
-        # A batch can be built and submitted successfully but still fail to
-        # apply server-side; conf_ports/unconf_ports above only reflect
-        # whether we could build the actions locally, so surface batch
-        # failures explicitly here rather than silently reporting success.
-        print(
-            "Warning: one or more Dashboard action batches failed to apply: "
-            + f"{failed_batch_ids}. Some ports reported as translated above "
-            + "may not actually be configured - check the batch(es) in "
-            + "Dashboard under Organization > Action batches."
-        )
-    if debug:
-        print(f"Failed batch IDs are as follows: {failed_batch_ids}")
 
     if debug:
         print(f"\nport_dict = {port_dict}\n")
