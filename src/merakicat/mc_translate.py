@@ -14,6 +14,35 @@ try:
 except ImportError:
     DEBUG = DEBUG_TRANSLATOR = False
 
+# Set by merakicat.py --ignore-port-count. The source/target port count check
+# in MerakiConfig is an assertion about our own parsing, not about the
+# hardware, so a bad parse must not strand someone in the field.
+IGNORE_PORT_COUNT = False
+
+
+def set_ignore_port_count(value: bool) -> None:
+    """Let the front end downgrade the port count check to a warning."""
+    global IGNORE_PORT_COUNT
+    IGNORE_PORT_COUNT = bool(value)
+
+
+def is_physical_port_type(intf_type: str) -> bool:
+    """
+    Is this IOS XE interface type a physical switch port?
+
+    Matched by suffix rather than an explicit list because IOS XE names a port
+    after its speed, and the speed vocabulary keeps growing: a C9300-48UXM
+    calls its 2.5G mGig downlinks TwoGigabitEthernet and a C9300-48UN calls
+    its 5G ones FiveGigabitEthernet. Every type this misses is silently
+    dropped from translation - it lands in Other_list, which nothing reads -
+    and also breaks the port count check in MerakiConfig, so err toward
+    matching. AppGigabitEthernet is not a front-panel port, but it is already
+    filtered out before we get here.
+    :param intf_type: Interface name with digits and slashes stripped
+    :return: True for a front-panel port type
+    """
+    return intf_type.endswith(("Ethernet", "GigE"))
+
 
 def Evaluate(config_file, nm_list, unified_os):
     """
@@ -32,6 +61,10 @@ def Evaluate(config_file, nm_list, unified_os):
     switch_dict = {}
     # List of interfaces that are shut
     shut_interfaces = list()
+    # Interfaces we could not split into a module/sub-module/port
+    unparsed_interfaces = list()
+    # Uplink/module ports left out because no uplink module was recognized
+    skipped_uplinks = list()
 
     def read_Cisco_SW():
         """
@@ -124,7 +157,14 @@ def Evaluate(config_file, nm_list, unified_os):
                             r"^interface\s\S+?GigE+(\d)"
                         )
                 port, sub_module = check(intf_name)
-                if sub_module == "1":
+                if sub_module == "":
+                    # check() couldn't find a module/sub-module/port in the
+                    # name (Tunnel, Bluetooth, a two-part GigabitEthernet0/1).
+                    # Meraki has nothing to map it to, so leave it out rather
+                    # than push a port with no number.
+                    unparsed_interfaces.append(intf_name)
+                    intf_include = False
+                elif sub_module == "1":
                     intf_include = False
                     if debug:
                         print(f"Switch_module = {Switch_module}")
@@ -145,6 +185,12 @@ def Evaluate(config_file, nm_list, unified_os):
                                                 + f"to {regex}\n"
                                             )
                                         break
+                    if not intf_include:
+                        # Dropped because no recognized uplink module holds it
+                        # or it carries no settings, so it never reaches
+                        # port_dict and can't show up in the port count
+                        # diagnostics. Remember it for the NOTE below.
+                        skipped_uplinks.append((Switch_module or "?", intf_name))
                 if intf_include:
                     # If we are including the interfaces, let's set a few
                     # default settings
@@ -224,6 +270,34 @@ def Evaluate(config_file, nm_list, unified_os):
                         port_dict[intf_name]["Port_Sec"] = max_mac
 
         Intf_list, Other_list = split_down_up_link(All_interfaces, Gig_uplink)
+        # Nothing downstream reads Other_list or the unparsed interfaces, so
+        # say out loud what we are dropping. A silently dropped downlink both
+        # goes unconfigured and throws off the port count check in
+        # MerakiConfig, which is a confusing way to find out about it.
+        dropped = [i for i in Other_list if not i.startswith("Port-channel")]
+        dropped += unparsed_interfaces
+        if dropped:
+            print(
+                f"NOTE: {len(dropped)} interface(s) in the config will not be "
+                + "translated because they are not front-panel switch ports: "
+                + ", ".join(dropped)
+            )
+        if skipped_uplinks:
+            # Per switch rather than by name: on a stack this is a dozen or
+            # more ports every run, and what matters when a port count comes
+            # up short is how many went where, not which ones.
+            per_switch = defaultdict(int)
+            for switch_module, _ in skipped_uplinks:
+                per_switch[switch_module] += 1
+            print(
+                f"NOTE: {len(skipped_uplinks)} uplink/module port(s) were not "
+                + "translated, having no recognized uplink module or no "
+                + "settings ("
+                + ", ".join(f"switch {sw}: {n}" for sw, n in sorted(per_switch.items()))
+                + ")."
+            )
+            if debug:
+                print(f"  skipped: {', '.join(n for _, n in skipped_uplinks)}")
         if debug:
             print(f"Intf_list = {Intf_list}\n")
             print(f"Other_list = {Other_list}\n")
@@ -248,17 +322,7 @@ def Evaluate(config_file, nm_list, unified_os):
             print(f"interfaces_list = {interfaces_list}\n")
         for key, value in interfaces_list.items():
             for value in interfaces_list_copy[key]:
-                if (
-                    key == "HundredGigabitEthernet"
-                    or key == "HundredGigE"
-                    or key == "FortyGigabitEthernet"
-                    or key == "TwentyFiveGigE"
-                    or key == "TenGigabitEthernet"
-                    or key == "FiveGigabitEthernet"
-                    or key == "GigabitEthernet"
-                    or key == "FastEthernet"
-                    or key == "Vlan"
-                ):
+                if key == "Vlan" or is_physical_port_type(key):
                     # pass
                     Intf_list.append(value)
                 else:
@@ -303,11 +367,22 @@ def Evaluate(config_file, nm_list, unified_os):
             Sub_module = obj.group(2)
         else:
             obj = re.search(r"(?:channel)(\d+)$", intf)
-            if debug:
-                print(f"obj.group(0) = {obj.group(0)}")
-                print(f"obj.group(1) = {obj.group(1)}")
-            port = obj.group(1)
-            Sub_module = 0
+            if obj is not None:
+                if debug:
+                    print(f"obj.group(0) = {obj.group(0)}")
+                    print(f"obj.group(1) = {obj.group(1)}")
+                port = obj.group(1)
+                Sub_module = 0
+            else:
+                # Neither module/sub-module/port nor Port-channel: a Tunnel,
+                # Bluetooth, or two-part name like GigabitEthernet0/1. Don't
+                # guess a port number - anything without a sub-module of "0"
+                # is left out of the port count and never configured, which is
+                # what we want for a non-front-panel interface.
+                if debug:
+                    print(f"Couldn't split {intf} into module/port.")
+                port = ""
+                Sub_module = ""
         return port, Sub_module
 
     Interfaces, Others, port_dict, switch_name = read_Cisco_SW()
@@ -531,6 +606,181 @@ def reconcile_ports_against_batches(
         print(f"{len(succeeded)} of {len(batch_ids)} action batches applied cleanly.")
 
 
+def model_port_count(model):
+    """
+    Best-effort front-panel port count for a Meraki or Catalyst model number.
+
+    Both vendors put the downlink count right after the first dash: MS225-48LP,
+    C9300-48UXM, C9200L-24PXG-4X. It is a convention, not a guarantee - a
+    C9200CX-8P-2X2G has more than 8 front-panel ports - so callers must treat
+    a disagreement as "look closer", not as fact.
+    :param model: Model string from the Dashboard inventory
+    :return: Port count as an int, or None if the model doesn't carry one
+    """
+    if not model:
+        return None
+    match = re.search(r"-(\d{1,2})", model)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def summarize_parsed_ports(port_dict, Intf_list):
+    """
+    Group the parsed Catalyst ports by stack member for the port count check.
+
+    :param port_dict: Dictionary of IOSXE ports and features from Evaluate
+    :param Intf_list: List of standard ports & L3 interfaces to configure
+    :return: Dict of switch number (1-based, int) -> dict with the downlink
+    :      : port names, the uplink/module port names we are skipping, and a
+    :      : per-interface-type count of the downlinks
+    """
+    summary = defaultdict(
+        lambda: {"downlinks": [], "uplinks": [], "types": defaultdict(int)}
+    )
+    for port in Intf_list:
+        if port.startswith("Vlan"):
+            continue
+        settings = port_dict[port]
+        try:
+            switch_num = int(settings.get("sw_module") or 1)
+        except ValueError:
+            switch_num = 1
+        entry = summary[switch_num]
+        if settings.get("sub_module") == "0":
+            entry["downlinks"].append(port)
+            entry["types"][re.sub(r"\d+|/", "", port)] += 1
+        else:
+            entry["uplinks"].append(port)
+    return summary
+
+
+def check_port_counts(
+    dashboard, organization_id, sw_list, port_dict, Intf_list, debug=False
+):
+    """
+    Confirm the Catalyst downlinks we parsed match the target Meraki switches.
+
+    A disagreement almost always means we mis-parsed the config rather than
+    that the hardware is wrong - especially when migrating a switch onto its
+    own Cloud ID, where source and target are the same physical box. So print
+    everything needed to tell the two apart instead of a bare one-liner: the
+    stack member to serial mapping, the model we compared against, and the
+    interfaces we counted, skipped, and dropped.
+    :param dashboard: Active Meraki dashboard API session to use
+    :param organization_id: Meraki Org ID the target switches live in
+    :param sw_list: List of Meraki switch serial numbers to configure
+    :param port_dict: Dictionary of IOSXE ports and features from Evaluate
+    :param Intf_list: List of standard ports & L3 interfaces to configure
+    :param debug: When True, print the parsed detail even when it all matches
+    :return: NONE - exits unless every switch matches or the check is ignored
+    """
+    summary = summarize_parsed_ports(port_dict, Intf_list)
+    if debug:
+        for switch_num in sorted(summary):
+            entry = summary[switch_num]
+            print(
+                f"switch {switch_num}: {len(entry['downlinks'])} downlinks "
+                + f"{dict(entry['types'])}, "
+                + f"{len(entry['uplinks'])} uplink/module ports"
+            )
+
+    rows = []
+    problems = []
+    for index, serial in enumerate(sw_list):
+        switch_num = index + 1
+        entry = summary.get(switch_num)
+        parsed = len(entry["downlinks"]) if entry else 0
+        try:
+            model = dashboard.organizations.getOrganizationInventoryDevice(
+                organization_id, serial
+            )["model"]
+        except Exception as error:
+            print(
+                f"Couldn't look up serial number {serial} in org "
+                + f"{organization_id}: {error}"
+            )
+            print(
+                "That serial has to be claimed into this organization before "
+                + "we can translate to it."
+            )
+            sys.exit()
+        port_max = model_port_count(model)
+        rows.append((switch_num, serial, model, port_max, parsed))
+        if port_max is None:
+            problems.append(
+                f"Switch {switch_num} ({serial}, {model}): couldn't read a "
+                + "port count out of the model number, so we can't check it."
+            )
+        elif port_max != parsed:
+            problems.append(
+                f"Switch {switch_num} ({serial}) is a {model} with {port_max} "
+                + f"ports, but we parsed {parsed} port(s) for switch "
+                + f"{switch_num} out of the Catalyst config."
+            )
+
+    # Config referring to stack members we have no target switch for is its
+    # own failure, and a likely cause of a count of 0 above.
+    extra = [num for num in sorted(summary) if num > len(sw_list)]
+    if extra:
+        problems.append(
+            "The Catalyst config has ports on switch(es) "
+            + ", ".join(str(num) for num in extra)
+            + f", but only {len(sw_list)} target serial number(s) were given: "
+            + ", ".join(str(s) for s in sw_list)
+        )
+
+    if not problems:
+        return
+
+    print("\nPort count check failed:")
+    for problem in problems:
+        print(f"  - {problem}")
+    print("\nWhat we parsed out of the Catalyst config:")
+    for switch_num, serial, model, port_max, parsed in rows:
+        entry = summary.get(switch_num) or {"types": {}, "uplinks": []}
+        print(
+            f"  switch {switch_num}  serial {serial}  model {model}  "
+            + f"model ports {port_max}  parsed downlinks {parsed}"
+        )
+        if entry["types"]:
+            types = ", ".join(f"{k} x{v}" for k, v in sorted(entry["types"].items()))
+            print(f"      counted by type: {types}")
+        if entry["uplinks"]:
+            print(
+                "      skipped as uplink/module ports: "
+                + ", ".join(entry["uplinks"])
+            )
+    for switch_num in sorted(summary):
+        if switch_num > len(sw_list):
+            entry = summary[switch_num]
+            print(
+                f"  switch {switch_num}  NO TARGET SERIAL  "
+                + f"parsed downlinks {len(entry['downlinks'])}"
+            )
+    print(
+        "\nUsual causes, most common first:\n"
+        + "  1. A port type we don't recognize, so its ports were dropped -\n"
+        + "     look for a NOTE about untranslated interfaces above.\n"
+        + "  2. A mixed-model stack whose serial numbers were given in a\n"
+        + "     different order than the switch numbers in the config.\n"
+        + "  3. A partial 'show running-config' capture, so some interfaces\n"
+        + "     never made it into the .cfg file in the files folder.\n"
+        + "  4. A model whose port count isn't the number in its name.\n"
+    )
+    if IGNORE_PORT_COUNT:
+        print(
+            "Continuing anyway because --ignore-port-count was given. Ports "
+            + "we didn't parse will not be configured.\n"
+        )
+        return
+    print(
+        "Stopping. Re-run with --ignore-port-count to translate the ports we "
+        + "did parse, or with DEBUG_TRANSLATOR set for the full parse.\n"
+    )
+    sys.exit()
+
+
 def MerakiConfig(
     dashboard,
     organization_id,
@@ -563,39 +813,7 @@ def MerakiConfig(
 
     # Make sure that the switches we are translating to have the same
     # number of ports
-    sw_check_list = list()
-    for serial in sw_list:
-        sw_check_list.append({"serial": serial, "ports": 0})
-    for port in Intf_list:
-        if not port.startswith("Vlan"):
-            if debug:
-                print(f"port = {port}")
-                print(f"port_dict[port] = {port_dict[port]}")
-            if port_dict[port]["sub_module"] == "0":
-                sw_check_list[int(port_dict[port]["sw_module"]) - 1]["ports"] += 1
-    if debug:
-        print(f"sw_check_list = {sw_check_list}")
-    for sw in sw_check_list:
-        try:
-            model = dashboard.organizations.getOrganizationInventoryDevice(
-                organization_id, sw["serial"]
-            )["model"]
-            if debug:
-                print(f"model = {model}")
-        except:
-            print("Couldn't get switch ports for serial number: " + f"{sw['serial']}.")
-            sys.exit()
-        port_max = int(re.search(r"-(\d{1,2})", model).group(1))
-        if debug:
-            print(
-                f"Switch with serial number {sw['serial']} has " + f"{port_max} ports."
-            )
-        if not port_max == sw["ports"]:
-            print(
-                f"Switch with serial number {sw['serial']} has {port_max} "
-                + f"ports, not {sw['ports']}!"
-            )
-            sys.exit()
+    check_port_counts(dashboard, organization_id, sw_list, port_dict, Intf_list, debug)
 
     # Create batch action lists
     action_list = list()

@@ -77,7 +77,7 @@ from mc_parallel import run_parallel_indexed
 from mc_ping import Ping
 from mc_register import Register
 from mc_splitcheck_serials import SplitCheckSerials
-from mc_translate import Evaluate, MerakiConfig
+from mc_translate import Evaluate, MerakiConfig, set_ignore_port_count
 from mc_utils import check_host_minimum_ios
 from netmiko.exceptions import ConnectionException, NetmikoTimeoutException
 from paramiko.ssh_exception import AuthenticationException
@@ -2867,6 +2867,16 @@ def init_force_pedia_refresh_argv() -> None:
         ]
 
 
+def init_ignore_port_count_argv() -> None:
+    """Strip --ignore-port-count from argv and pass it to the translator."""
+    ignore = "--ignore-port-count" in sys.argv
+    if ignore:
+        sys.argv = [sys.argv[0]] + [
+            a for a in sys.argv[1:] if a != "--ignore-port-count"
+        ]
+    set_ignore_port_count(ignore)
+
+
 def get_repo_file_commit_epoch(file_path: str) -> float | None:
     """Return the latest repo commit time for a file path."""
     commits_url = f"{REPO_API_URL}/commits"
@@ -3280,6 +3290,7 @@ def initialize_merakicat() -> meraki.DashboardAPI | None:
     tabulate.PRESERVE_WHITESPACE = True  # type: ignore
     init_dry_run_argv()
     init_force_pedia_refresh_argv()
+    init_ignore_port_count_argv()
     init_debug_flags()
     set_bot_from_argv()
     kind = cli_startup_kind()
