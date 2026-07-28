@@ -1259,13 +1259,23 @@ def MerakiConfig(
                 # there is one in the SWITCH section of the encyclopedia
                 newvals = {}
                 if short_list[item] in mc_pedia["switch"].keys():
-                    exec(
-                        mc_pedia["switch"][short_list[item]]["meraki"].get(
-                            "post_ports_process"
-                        ),
-                        locals(),
-                        newvals,
-                    )
+                    try:
+                        exec(
+                            mc_pedia["switch"][short_list[item]]["meraki"].get(
+                                "post_ports_process"
+                            ),
+                            locals(),
+                            newvals,
+                        )
+                    except Exception as pp_exc:
+                        # Same reasoning as the port-level exec above: this
+                        # runs after the port batch has been submitted, so an
+                        # unhandled snippet error would abort the run and lose
+                        # the report for work that already happened.
+                        print(
+                            "We caught an exception in the post-port process "
+                            + f"for {short_list[item]}: {pp_exc}"
+                        )
                     if debug:
                         print(f"return_vals = {return_vals}")
                     if "return_vals" in newvals:

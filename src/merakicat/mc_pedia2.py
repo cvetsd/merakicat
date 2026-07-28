@@ -658,6 +658,13 @@ for route in switch_dict['static_routing']:
                 'post_ports_process': """
 for route in switch_dict['static_routing']:
     if not route['subnet'] == '0.0.0.0/0':
+        if not switch_dict.get('ip_routing'):
+            # Same rule as the SVIs: with no 'ip routing' this is a Layer 2
+            # switch, no L3 interfaces were created, and Dashboard rejects a
+            # static route without one. Report rather than fail the run.
+            print(f"Skipping static route {route['subnet']} via {route['gw']}: the source")
+            print("    config has no 'ip routing', so this switch does not route.")
+            continue
         if 'switchStackId' in switch_dict.keys():
             dashboard.switch.createNetworkSwitchStackRoutingStaticRoute(switch_dict['networkId'],switch_dict['switchStackId'],route['subnet'],route['gw'])
         else:
