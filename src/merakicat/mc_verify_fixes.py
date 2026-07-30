@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 TEMP = os.path.join("..", "..", "TempFiles")
 MDF_PD = os.path.join(TEMP, "Clairmont_MDF.pd")
 IDF_PD = os.path.join(TEMP, "Clairmont_IDF_C137.pd")
+WWTP_CFG = os.path.join(TEMP, "WWTP-Reuse-SW1.cfg")
 
 FAILURES = []
 
@@ -78,8 +79,10 @@ def run_snippet(snippet, extra):
 
 def main():
     from mc_pedia2 import mc_pedia
-    from mc_translate import (Evaluate, reconcile_port_vlan_args,
+    from mc_translate import (Evaluate, is_physical_port_type,
+                              model_port_count, reconcile_port_vlan_args,
                               reconcile_ports_against_batches,
+                              summarize_parsed_ports,
                               validate_port_action_args)
     import mc_meraki_dry_run
     import mc_translate
@@ -261,6 +264,148 @@ def main():
         check(f"{name}: parsed values match what was sent", drift, [])
         check(f"{name}: detected as Layer 2 (no 'ip routing')",
               switch_dict.get("ip_routing"), [])
+
+    # --------------------------------------------------- port type vocabulary
+    section("Every IOS XE front-panel port type is recognized")
+    # The old hardcoded list in split_down_up_link named eight types and
+    # omitted TwoGigabitEthernet, so a C9300-48UXM's 36 mGig downlinks were
+    # dropped into Other_list (which nothing reads) and the port count check
+    # aborted the run with "has 48 ports, not 12!". Speed names keep being
+    # added, so assert the suffix rule against the whole vocabulary.
+    for intf_type in ("FastEthernet", "GigabitEthernet", "TwoGigabitEthernet",
+                      "FiveGigabitEthernet", "TenGigabitEthernet",
+                      "TwentyFiveGigE", "FortyGigabitEthernet",
+                      "HundredGigabitEthernet", "HundredGigE",
+                      "TwoHundredGigabitEthernet",
+                      "FourHundredGigabitEthernet"):
+        check(f"{intf_type} is a physical port", is_physical_port_type(intf_type),
+              True)
+    for intf_type in ("Vlan", "Port-channel", "Tunnel", "Loopback",
+                      "Bluetooth"):
+        check(f"{intf_type} is not a physical port",
+              is_physical_port_type(intf_type), False)
+
+    # ------------------------------------------------------ WWTP-Reuse-SW1
+    if not os.path.isfile(WWTP_CFG):
+        print(f"\n--- SKIPPED: {WWTP_CFG} not present, so the C9300-48UXM "
+              "mGig regression is unverified this run.")
+    else:
+        section("C9300-48UXM mGig downlinks reach the port count check")
+        Intf_list, Other_list, port_dict, switch_dict = Evaluate(
+            WWTP_CFG, [""] * 9, True)
+        summary = summarize_parsed_ports(port_dict, Intf_list)
+        check("nothing is dropped into the unread Other_list", Other_list, [])
+        check("switch 1 downlinks parsed", len(summary[1]["downlinks"]), 48)
+        check("counted by interface type", dict(summary[1]["types"]),
+              {"TwoGigabitEthernet": 36, "TenGigabitEthernet": 12})
+        check("model port count agrees, so the run proceeds",
+              model_port_count("C9300-48UXM"), 48)
+        # Uplink module ports need `show inventory` over SSH (mc_get_nms), so a
+        # file-based translate cannot place them and must leave them out rather
+        # than guess a Meraki port number.
+        check("module ports stay out of Intf_list",
+              [p for p in Intf_list if "/1/" in p], [])
+        check("both SVIs parsed", sorted(p for p in Intf_list
+                                        if p.startswith("Vlan")),
+              ["Vlan1", "Vlan9"])
+        check("detected as Layer 2 (no 'ip routing')",
+              switch_dict.get("ip_routing"), [])
+        check("voice VLAN on access ports survives",
+              port_dict["TwoGigabitEthernet1/0/1"].get("voiceVlan"), "90")
+        check("the one trunk downlink keeps its native VLAN",
+              (port_dict["TwoGigabitEthernet1/0/2"].get("type"),
+               port_dict["TwoGigabitEthernet1/0/2"].get("nativeVlan")),
+              ("trunk", "9"))
+
+        section("An uplink module model we don't know must not abort the run")
+        # nm_dict covers 18 modules and no C9200 ones at all, and GetNmList
+        # feeds it whatever string the switch reports. Both lookups used to be
+        # unguarded, so an unlisted model raised a bare KeyError after the
+        # config had already been pulled over SSH.
+        try:
+            unknown = Evaluate(WWTP_CFG, ["C9200-NM-4X"] + [""] * 8, True)
+            check("unknown module: downlinks still parsed",
+                  len(summarize_parsed_ports(unknown[2], unknown[0])[1]
+                      ["downlinks"]), 48)
+            check("unknown module: its ports are left out",
+                  [p for p in unknown[0] if "/1/" in p], [])
+        except KeyError as exc:
+            check("unknown module does not raise KeyError",
+                  f"KeyError: {exc}", "no exception")
+        known = Evaluate(WWTP_CFG, ["C9300-NM-4G"] + [""] * 8, True)
+        check("known module: its configured ports are translated",
+              [p for p in known[0] if "/1/" in p],
+              ["GigabitEthernet1/1/2", "GigabitEthernet1/1/3",
+               "GigabitEthernet1/1/4"])
+
+    section("An interface with no Meraki port number is never pushed")
+    # If args ever gains no entry for an Intf_list index, every later args[y]
+    # belongs to a different interface - so the fallback keeps the list aligned
+    # and relies on the validator to drop the placeholder.
+    ok_args = {"type": "trunk"}
+    for port_id in ("1", "48", "1_C9300-NM-4G_2"):
+        check(f"port id {port_id!r} is accepted",
+              validate_port_action_args(ok_args, "Gi1/0/1", port_id), [])
+    for port_id in ("GigabitEthernet1/1/2", "", "1_"):
+        check(f"port id {port_id!r} is rejected",
+              len(validate_port_action_args(ok_args, "Gi1/1/2", port_id)), 1)
+    check("port id is only checked when supplied",
+          validate_port_action_args(ok_args, "Gi1/0/1"), [])
+
+    # ------------------------------------------------- precheck version gate
+    section("The IOS XE version prechecks are reachable")
+    from mc_prechecks import prechecks
+
+    # Everything except 'show version' is answered with clean output, so the
+    # only issue a run can report is the version one under test.
+    # Line offsets matter: prechecks reads index 3 or 6 depending on release,
+    # then locates the data rows two lines below the "Switch#" header.
+    COMPAT = (
+        "\n"
+        "Migration compatibility for this switch/stack\n"
+        "\n"
+        "\n"
+        "Switch#  Model        Compatible?  Bootloader  Compatible?\n"
+        "-------  -----        -----------  ----------  -----------\n"
+        "1        C9300-48UXM  Compatible   17.12.1     Compatible"
+    )
+
+    class StubConn:
+        def __init__(self, version):
+            self.version = version
+
+        def send_command(self, cmd):
+            if cmd == "show version":
+                return f"Cisco IOS XE Software\nCisco IOS Software, Version {self.version}\n"
+            if cmd == "show ip name-servers":
+                return "192.168.9.1"
+            if cmd.startswith("show ip int brief"):
+                return "Vlan9  192.168.9.243  YES  NVRAM  up  up"
+            if cmd.startswith("show ip route"):
+                return "S* 0.0.0.0/0 [1/0] via 192.168.9.250"
+            if cmd == "show meraki compatibility":
+                return COMPAT
+            return ""
+
+    # Nested under `if v[0] < 17`, all three of these were unreachable for any
+    # 17.x release, so the two versions with documented registration failures
+    # were never named - and 16.12.5 passed because its patch was not < 1.
+    KNOWN_ISSUE = "There is a known issue registering to Dashboard from IOSXE "
+    for version, want in (
+        ("16.12.5", ["IOSXE version 16.12.5 is less than 17.10.1"]),
+        ("17.9.5", ["IOSXE version 17.9.5 is less than 17.10.1"]),
+        ("17.10.1", []),
+        ("17.13.1", [KNOWN_ISSUE + "17.13.1"]),
+        ("17.15.1", []),
+        ("17.15.3", [KNOWN_ISSUE + "17.15.3"]),
+        ("17.18.1", []),
+    ):
+        result = prechecks(StubConn(version))
+        check(f"{version}: reported issues", result.issues, want)
+    check("17.18.1 is a unified OS release",
+          prechecks(StubConn("17.18.1")).unified_os, True)
+    check("17.12.4 is not a unified OS release",
+          prechecks(StubConn("17.12.4")).unified_os, False)
 
     print("\n" + ("PASS - all assertions held" if not FAILURES
                   else f"FAIL - {len(FAILURES)}: {FAILURES}"))
