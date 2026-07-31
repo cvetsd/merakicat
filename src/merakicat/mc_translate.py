@@ -65,6 +65,9 @@ def Evaluate(config_file, nm_list, unified_os):
     unparsed_interfaces = list()
     # Uplink/module ports left out because no uplink module was recognized
     skipped_uplinks = list()
+    # Uplink module models GetNmList read off the switch that nm_dict has no
+    # entry for, so we only report each one once
+    unknown_nms = set()
 
     def read_Cisco_SW():
         """
@@ -169,11 +172,27 @@ def Evaluate(config_file, nm_list, unified_os):
                     if debug:
                         print(f"Switch_module = {Switch_module}")
                         print(f"nm_list = {nm_list}")
-                    if not nm_list[int(Switch_module) - 1] == "":
-                        if nm_dict[nm_list[int(Switch_module) - 1]]["supported"]:
-                            for regex in nm_dict[nm_list[int(Switch_module) - 1]][
-                                "ports"
-                            ]:
+                    nm_model = nm_list[int(Switch_module) - 1]
+                    if nm_model != "" and nm_model not in nm_dict:
+                        # GetNmList reads whatever model string the switch
+                        # reports, and nm_dict covers only the modules we know
+                        # the port layout for - C9200 modules, for instance,
+                        # are absent entirely. An unguarded lookup here used to
+                        # raise a bare KeyError that aborted the whole run
+                        # after the config had already been pulled.
+                        if nm_model not in unknown_nms:
+                            unknown_nms.add(nm_model)
+                            print(
+                                f"Uplink module {nm_model} on switch "
+                                + f"{Switch_module} isn't in the module table, "
+                                + "so its ports can't be mapped to Meraki port "
+                                + "numbers and will be skipped. Please report "
+                                + "the model so it can be added."
+                            )
+                        nm_model = ""
+                    if nm_model != "":
+                        if nm_dict[nm_model]["supported"]:
+                            for regex in nm_dict[nm_model]["ports"]:
                                 if re.match(regex, intf_name):
                                     # Make sure it has some settings,
                                     # or skip it
@@ -433,7 +452,12 @@ def reconcile_port_vlan_args(port_args, intf_settings, port_label=""):
     return notes
 
 
-def validate_port_action_args(port_args, port_label=""):
+# A Meraki switch port ID is the downlink number ("24") or, for a port on an
+# uplink module, "1_<module model>_<n>" as built in loop_configure_meraki.
+_VALID_PORT_ID = re.compile(r"^(?:\d+|1_[A-Za-z0-9-]+_\d+)$")
+
+
+def validate_port_action_args(port_args, port_label="", port_id=None):
     """
     Return the reasons Dashboard would reject this updateDeviceSwitchPort body.
 
@@ -443,10 +467,21 @@ def validate_port_action_args(port_args, port_label=""):
 
     :param port_args: The Meraki args dict for this port
     :param port_label: The interface descriptor, used in the returned problems
+    :param port_id: The Meraki port ID the action targets, when known
     :return: List of human-readable problems; empty means the port looks valid
     """
     problems = []
     port_type = port_args.get("type")
+
+    if port_id is not None and not _VALID_PORT_ID.match(str(port_id)):
+        # A downlink is a bare number and an uplink module port is
+        # 1_<module>_<n>. Anything else means we never worked out which Meraki
+        # port this interface maps to, and guessing would configure the wrong
+        # one.
+        problems.append(
+            f"{port_label}: couldn't map this interface to a Meraki port "
+            + f"number (got {port_id!r})"
+        )
 
     if port_type not in ("access", "trunk", "stack"):
         problems.append(f"{port_label}: invalid port type {port_type!r}")
@@ -915,7 +950,11 @@ def MerakiConfig(
             if "Vlan" not in interface_descriptor:
                 # Setup the features for a physical interface
                 if intf_settings["sub_module"] == "1":
-                    if not nm_list[switch_num] == "":
+                    # Evaluate already reported and dropped any module model
+                    # nm_dict has no entry for, so the membership test is
+                    # belt-and-braces against a KeyError mid-translation.
+                    port = ""
+                    if nm_list[switch_num] in nm_dict:
                         for regex in nm_dict[nm_list[switch_num]]["ports"]:
                             if re.match(regex, interface_descriptor):
                                 if debug:
@@ -925,7 +964,17 @@ def MerakiConfig(
                                     )
                                 port = "1_" + nm_list[switch_num]
                                 port += "_" + intf_settings["port"]
-                                args.append([sw_list[switch_num], port, {}])
+                                break
+                    # args has to gain exactly one entry per Intf_list index or
+                    # every later args[y] belongs to a different interface, and
+                    # this port's settings get pushed onto that one. Evaluate
+                    # only includes a module port after it has matched a known
+                    # module, so the miss below should be unreachable - but the
+                    # cost of being wrong is configuring the wrong port, so
+                    # keep the list aligned and let the validator reject it.
+                    args.append(
+                        [sw_list[switch_num], port or interface_descriptor, {}]
+                    )
                 else:
                     args.append([sw_list[switch_num], intf_settings["port"], {}])
                 # Setup the default features
@@ -1153,7 +1202,7 @@ def MerakiConfig(
                 # reject costs us every other port in the batch. Leave it out
                 # and report it rather than gamble the whole run on it.
                 problems = validate_port_action_args(
-                    args[y][2], interface_descriptor
+                    args[y][2], interface_descriptor, args[y][1]
                 )
                 if problems:
                     for problem in problems:
@@ -1259,13 +1308,23 @@ def MerakiConfig(
                 # there is one in the SWITCH section of the encyclopedia
                 newvals = {}
                 if short_list[item] in mc_pedia["switch"].keys():
-                    exec(
-                        mc_pedia["switch"][short_list[item]]["meraki"].get(
-                            "post_ports_process"
-                        ),
-                        locals(),
-                        newvals,
-                    )
+                    try:
+                        exec(
+                            mc_pedia["switch"][short_list[item]]["meraki"].get(
+                                "post_ports_process"
+                            ),
+                            locals(),
+                            newvals,
+                        )
+                    except Exception as pp_exc:
+                        # Same reasoning as the port-level exec above: this
+                        # runs after the port batch has been submitted, so an
+                        # unhandled snippet error would abort the run and lose
+                        # the report for work that already happened.
+                        print(
+                            "We caught an exception in the post-port process "
+                            + f"for {short_list[item]}: {pp_exc}"
+                        )
                     if debug:
                         print(f"return_vals = {return_vals}")
                     if "return_vals" in newvals:

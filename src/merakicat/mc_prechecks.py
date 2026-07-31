@@ -55,20 +55,23 @@ def prechecks(net_connect: Any) -> PrecheckResult:
         print(f"In Register, version = {version}")
     if debug:
         print(f"In Register, v = {v}")
-    if v[0] < 17:
-        if v[1] < 10:
-            if v[2] < 1:
-                issues.append(f"IOSXE version {version} is less than 17.10.1")
-        elif v[1] == 13 and v[2] == 1:
-            issues.append(
-                "There is a known issue registering to "
-                + "Dashboard from IOSXE 17.13.1"
-            )
-        elif v[1] == 15 and v[2] == 3:
-            issues.append(
-                "There is a known issue registering to "
-                + "Dashboard from IOSXE 17.15.3"
-            )
+    # Compare the whole [major, minor, patch] tuple. These used to be nested
+    # under `if v[0] < 17`, which made all three unreachable for any 17.x
+    # release - so the two versions with known registration failures were
+    # never reported - while a 16.12.5 switch, far below the floor, passed
+    # because its patch number was not < 1.
+    if v < [17, 10, 1]:
+        issues.append(f"IOSXE version {version} is less than 17.10.1")
+    elif v[0] == 17 and v[1] == 13 and v[2] == 1:
+        issues.append(
+            "There is a known issue registering to "
+            + "Dashboard from IOSXE 17.13.1"
+        )
+    elif v[0] == 17 and v[1] == 15 and v[2] == 3:
+        issues.append(
+            "There is a known issue registering to "
+            + "Dashboard from IOSXE 17.15.3"
+        )
 
     unified_os = unified_os_from_version(v)
 
